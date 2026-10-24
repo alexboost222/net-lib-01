@@ -3076,4 +3076,134 @@ mod tests {
         s.update(t + Duration::from_secs(5));
         assert_eq!(s.peer_addr(sp), Some(C));
     }
+
+    #[derive(Clone, Default)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<Vec<(&'static str, alloc::string::String)>>>>);
+
+    impl LogSink for Capture {
+        fn enabled(&self, _: Level) -> bool {
+            true
+        }
+        fn log(&mut self, r: &Record<'_>) {
+            let props = r
+                .properties
+                .iter()
+                .map(|p| (p.name, alloc::format!("{}", p.value)))
+                .collect();
+            self.0.lock().unwrap().push(props);
+        }
+    }
+
+    #[test]
+    fn peer_stats_event_reports_the_window_only() {
+        let (mut s, _, _, sp, t) = pair(&[DeliveryMode::Unreliable], |_| {});
+        let index = s.index_of(sp).unwrap();
+        let peer = s.slots[index].peer.as_mut().unwrap();
+        peer.stats_base = PeerStats {
+            packets_sent: 100,
+            packets_lost: 10,
+            bytes_sent: 100_000,
+            bytes_received: 50_000,
+            messages_retransmitted: 5,
+            ..PeerStats::default()
+        };
+        peer.stats = PeerStats {
+            packets_sent: 200,
+            packets_lost: 15,
+            bytes_sent: 160_000,
+            bytes_received: 80_000,
+            messages_retransmitted: 7,
+            ..PeerStats::default()
+        };
+        peer.last_stats = t;
+        let cap = Capture::default();
+        let mut log = Logger {
+            sink: Some(alloc::boxed::Box::new(cap.clone())),
+        };
+        let end = t + Duration::from_secs(2);
+        log_peer_stats(&mut log, peer, end, 1200);
+        let got = cap.0.lock().unwrap()[0].clone();
+        let get = |n: &str| got.iter().find(|(k, _)| *k == n).unwrap().1.clone();
+        assert_eq!(get("LossPercent"), "5");
+        assert_eq!(get("BytesOutPerSec"), "30000");
+        assert_eq!(get("BytesInPerSec"), "15000");
+        assert_eq!(get("FillPercent"), "50");
+        assert_eq!(get("Retransmitted"), "2");
+        assert_eq!(peer.stats_base, peer.stats);
+        assert_eq!(peer.last_stats, end);
+    }
+
+    #[test]
+    fn only_connected_outgoing_peers_prove_a_new_address() {
+        let (mut s, mut c, id, sp, _) = pair(&[DeliveryMode::Unreliable], |_| {});
+        let migrating = |m: &Manager, id: PeerId| m.peer(id).unwrap().migrate_from.is_some();
+        s.local_address_changed();
+        assert!(!migrating(&s, sp), "the server side never migrates");
+        let t = Time::from_millis(1);
+        let pending = c.connect(t, C2, &[]).unwrap();
+        c.local_address_changed();
+        assert!(!migrating(&c, pending), "not connected yet");
+        assert!(migrating(&c, id));
+    }
+
+    #[test]
+    fn unvalidated_address_gets_at_most_three_times_its_bytes() {
+        let (mut s, mut c, id, sp, mut t) = pair(&[DeliveryMode::Unreliable], |_| {});
+        c.local_address_changed();
+        c.send(id, 0, &[1; 300]).unwrap();
+        t = t + Duration::from_millis(10);
+        c.flush(t);
+        deliver(&mut s, t, C2, &drain(&mut c));
+        let received = s.peer(sp).unwrap().path.unwrap().received;
+        let challenge: usize = drain(&mut s).iter().map(Vec::len).sum();
+        let budget = 3 * received - challenge;
+        let mut sent = Vec::new();
+        for n in [1, 40, 40] {
+            for _ in 0..n {
+                s.send(sp, 0, &[2; 50]).unwrap();
+            }
+            s.flush(t);
+            sent.push(drain(&mut s).iter().map(Vec::len).sum::<usize>());
+        }
+        let total: usize = sent.iter().sum();
+        assert!(sent[0] > 0 && sent[1] > 0, "{sent:?}");
+        assert_eq!(sent[2], 0, "budget spent: {sent:?}");
+        assert!(total <= budget, "{total} > {budget}");
+        assert!(total + 80 > budget, "{total} far below {budget}");
+    }
+
+    #[test]
+    fn acks_for_packets_never_sent_are_ignored() {
+        let (mut s, mut c, id, sp, t) = pair(&[DeliveryMode::Unreliable], |_| {});
+        s.send(sp, 0, b"lost").unwrap();
+        s.flush(t);
+        let last = seq_of(&drain(&mut s)[0]);
+        let before = s.peer_stats(sp).unwrap().clone();
+        c.send(id, 0, b"x").unwrap();
+        c.flush(t);
+        let real = drain(&mut c).remove(0);
+        // Fresh seq, ack 5 ahead of the last packet sent, every earlier bit set.
+        let mut p = vec![TYPE_DATA | crate::wire::FLAG_ACK, real[1], real[2]];
+        p.extend_from_slice(&last.wrapping_add(5).to_le_bytes());
+        p.extend_from_slice(&[0xff, 0xff, 0]);
+        s.handle_datagram(t, C, &p);
+        let after = s.peer_stats(sp).unwrap();
+        assert_eq!(after.packets_received, before.packets_received + 1);
+        assert_eq!(after.packets_acked, before.packets_acked);
+        assert_eq!(after.packets_lost, before.packets_lost);
+    }
+
+    #[test]
+    fn next_timeout_is_the_earliest_timer() {
+        let t = Time::from_millis(1);
+        let mut c = client();
+        assert_eq!(c.next_timeout(), None);
+        c.connect(t, S, &[]).unwrap();
+        assert_eq!(c.next_timeout(), Some(t + c.config().connect_retry));
+        let (_, c, id, _, t) = pair(&[DeliveryMode::Unreliable], |_| {});
+        let peer = c.peer(id).unwrap();
+        let want = (peer.last_ping + c.config().ping_interval).min(peer.last_recv + c.config().timeout);
+        assert_eq!(c.next_timeout(), Some(want));
+        assert!(want > t);
+    }
 }

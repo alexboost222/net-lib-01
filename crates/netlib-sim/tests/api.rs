@@ -168,3 +168,37 @@ fn pending_peers_are_not_connected_yet() {
     );
     assert_eq!(m.peer_state(pending), None);
 }
+
+#[test]
+fn rtt_accessors_follow_the_link() {
+    let link = Link {
+        latency: Duration::from_millis(20),
+        jitter: Duration::from_millis(6),
+        ..Link::default()
+    };
+    let mut sim = Sim::new(4, link);
+    sim.add_node(config(true)).unwrap();
+    sim.add_node(config(false)).unwrap();
+    let id = connect(&mut sim, 1);
+    run(&mut sim, 16);
+    for _ in 0..128 {
+        sim.manager(1).send(id, 0, b"tick").unwrap();
+        run(&mut sim, 1);
+    }
+    let m = sim.manager(1);
+    let ms = Duration::from_millis;
+    let (min, latest, var, srtt) = (
+        m.peer_min_rtt(id).unwrap(),
+        m.peer_latest_rtt(id).unwrap(),
+        m.peer_rtt_var(id).unwrap(),
+        m.peer_rtt(id).unwrap(),
+    );
+    assert!(min >= ms(40) && min <= latest, "min {min:?}, latest {latest:?}");
+    assert!(latest <= ms(40) + ms(12) + TICK * 2, "latest {latest:?}");
+    assert!(var > Duration::ZERO && var < ms(20), "var {var:?}");
+    assert!(srtt >= min && srtt < ms(70), "srtt {srtt:?}");
+    let gone = PeerId::from_bits(u64::MAX);
+    assert_eq!(m.peer_min_rtt(gone), None);
+    assert_eq!(m.peer_latest_rtt(gone), None);
+    assert_eq!(m.peer_rtt_var(gone), None);
+}
