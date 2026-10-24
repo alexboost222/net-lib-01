@@ -117,6 +117,9 @@ pub struct Config {
     /// Waiting time after which any queued message reaches the top priority (255), so low
     /// priority traffic cannot starve.
     pub starvation_time: Duration,
+    /// Client side: after this long without packets from the server, outgoing packets carry
+    /// migration fields (12 bytes) in case our address changed unnoticed.
+    pub migration_probe: Duration,
 }
 
 impl Default for Config {
@@ -140,6 +143,7 @@ impl Default for Config {
             max_reliable_queue: 4096,
             bandwidth: None,
             starvation_time: Duration::from_millis(500),
+            migration_probe: Duration::from_millis(1500),
         }
     }
 }
@@ -196,6 +200,7 @@ impl Config {
             || self.cookie_lifetime < Duration::from_secs(1)
             || self.min_rto > self.max_rto
             || self.max_ack_delay > crate::wire::MAX_WIRE_ACK_DELAY
+            || self.migration_probe <= self.ping_interval
         {
             return Err(ConfigError::Timing);
         }

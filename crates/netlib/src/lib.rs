@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -66,6 +66,8 @@ pub struct SocketStats {
     pub send_errors: u64,
     /// Receive errors that were skipped, such as ICMP port unreachable on Windows.
     pub recv_errors: u64,
+    /// Times the socket was recreated, by `rebind` or after it stopped working.
+    pub rebinds: u64,
 }
 
 /// How often the receive thread wakes up to check for shutdown.
@@ -79,7 +81,13 @@ struct Shared {
 
 struct Inner {
     shared: Mutex<Shared>,
-    socket: UdpSocket,
+    socket: RwLock<Arc<UdpSocket>>,
+    /// Address the socket is bound to again on `rebind`.
+    bind_addr: SocketAddr,
+    receive_thread: bool,
+    /// Set when the socket reported an error that means it is gone (e.g. closed by the OS
+    /// while the app was in background); `poll` recreates it.
+    broken: AtomicBool,
     epoch: Instant,
     stop: AtomicBool,
 }
@@ -87,6 +95,10 @@ struct Inner {
 impl Inner {
     fn now(&self) -> Time {
         Time::from_micros(u64::try_from(self.epoch.elapsed().as_micros()).unwrap_or(u64::MAX))
+    }
+
+    fn socket(&self) -> Arc<UdpSocket> {
+        Arc::clone(&self.socket.read().unwrap_or_else(|e| e.into_inner()))
     }
 
     fn lock(&self) -> MutexGuard<'_, Shared> {
@@ -102,12 +114,38 @@ impl Inner {
     }
 }
 
-fn transmit(shared: &mut Shared, socket: &UdpSocket) {
+/// Errors after which a socket will not work again and has to be recreated.
+fn socket_is_broken(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::NotConnected
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::AddrNotAvailable
+            | io::ErrorKind::NetworkDown
+    ) || e.raw_os_error() == Some(9) // EBADF: closed under us
+}
+
+fn new_socket(addr: SocketAddr, receive_thread: bool) -> io::Result<UdpSocket> {
+    let socket = UdpSocket::bind(addr)?;
+    if receive_thread {
+        socket.set_read_timeout(Some(RECV_TIMEOUT))?;
+    } else {
+        socket.set_nonblocking(true)?;
+    }
+    Ok(socket)
+}
+
+fn transmit(shared: &mut Shared, inner: &Inner) {
+    let socket = inner.socket();
     let Shared { core, tx_buf, stats } = shared;
     while let Some((to, n)) = core.poll_transmit(tx_buf) {
         // UDP gives no delivery guarantee; a datagram we cannot send now is lost.
-        if socket.send_to(&tx_buf[..n], to).is_err() {
+        if let Err(e) = socket.send_to(&tx_buf[..n], to) {
             stats.send_errors += 1;
+            if socket_is_broken(&e) {
+                inner.broken.store(true, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -115,17 +153,21 @@ fn transmit(shared: &mut Shared, socket: &UdpSocket) {
 fn receive_loop(inner: Arc<Inner>, mtu: usize) {
     let mut buf = vec![0u8; mtu + 1];
     while !inner.stop.load(Ordering::Relaxed) {
-        match inner.socket.recv_from(&mut buf) {
+        let socket = inner.socket();
+        match socket.recv_from(&mut buf) {
             Ok((n, from)) => {
                 let (mut shared, now) = inner.lock_now();
                 shared.core.handle_datagram(now, from, &buf[..n]);
-                transmit(&mut shared, &inner.socket);
+                transmit(&mut shared, &inner);
             }
             Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => {
+            Err(e) => {
                 // Includes ICMP port unreachable on Windows. Keep receiving, but do not spin
                 // if the socket is broken.
+                if socket_is_broken(&e) {
+                    inner.broken.store(true, Ordering::Relaxed);
+                }
                 inner.lock().stats.recv_errors += 1;
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -223,7 +265,11 @@ pub struct Manager {
     thread: Option<JoinHandle<()>>,
     recv_buf: Vec<u8>,
     events: EventBuf,
+    last_auto_rebind: Option<Instant>,
 }
+
+/// Automatic socket recreation happens at most this often.
+const AUTO_REBIND_INTERVAL: Duration = Duration::from_secs(1);
 
 impl Manager {
     /// Binds a socket with the default driver settings. Use port 0 for clients.
@@ -233,12 +279,14 @@ impl Manager {
 
     /// Binds a socket with explicit driver settings.
     pub fn bind_with(addr: impl ToSocketAddrs, config: Config, driver: DriverConfig) -> Result<Self, BindError> {
-        let socket = UdpSocket::bind(addr).map_err(BindError::Io)?;
-        if driver.receive_thread {
-            socket.set_read_timeout(Some(RECV_TIMEOUT)).map_err(BindError::Io)?;
-        } else {
-            socket.set_nonblocking(true).map_err(BindError::Io)?;
-        }
+        let addr = addr
+            .to_socket_addrs()
+            .and_then(|mut a| {
+                a.next()
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no address"))
+            })
+            .map_err(BindError::Io)?;
+        let socket = new_socket(addr, driver.receive_thread).map_err(BindError::Io)?;
         let mut secret = [0u8; 32];
         getrandom::fill(&mut secret).map_err(|_| BindError::Random)?;
         let mtu = config.mtu;
@@ -250,7 +298,10 @@ impl Manager {
                 tx_buf: vec![0; mtu],
                 stats: SocketStats::default(),
             }),
-            socket,
+            socket: RwLock::new(Arc::new(socket)),
+            bind_addr: addr,
+            receive_thread: driver.receive_thread,
+            broken: AtomicBool::new(false),
             epoch,
             stop: AtomicBool::new(false),
         });
@@ -270,6 +321,7 @@ impl Manager {
             // One extra byte detects oversized datagrams, which the core drops.
             recv_buf: vec![0; mtu + 1],
             events: EventBuf::default(),
+            last_auto_rebind: None,
         })
     }
 
@@ -280,7 +332,22 @@ impl Manager {
 
     /// The bound address.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.inner.socket.local_addr()
+        self.inner.socket().local_addr()
+    }
+
+    /// Replaces the socket with a new one bound to the original address (a new port if it
+    /// was 0). Connections continue: the server moves them to the new address.
+    ///
+    /// Called automatically by `poll` when the socket stops working, e.g. after the OS
+    /// closed it while the app was in background.
+    pub fn rebind(&mut self) -> io::Result<()> {
+        let socket = new_socket(self.inner.bind_addr, self.inner.receive_thread)?;
+        *self.inner.socket.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(socket);
+        self.inner.broken.store(false, Ordering::Relaxed);
+        let mut shared = self.inner.lock();
+        shared.core.local_address_changed();
+        shared.stats.rebinds += 1;
+        Ok(())
     }
 
     /// Runs `f` with the sans-IO core locked, for statistics and peer queries.
@@ -298,6 +365,11 @@ impl Manager {
         self.with_core(|c| c.peer_rtt(peer))
     }
 
+    /// Remote address of a peer.
+    pub fn peer_addr(&self, peer: PeerId) -> Option<SocketAddr> {
+        self.with_core(|c| c.peer_addr(peer))
+    }
+
     /// Counters of a peer.
     pub fn peer_stats(&self, peer: PeerId) -> Option<PeerStats> {
         self.with_core(|c| c.peer_stats(peer).cloned())
@@ -311,9 +383,18 @@ impl Manager {
     /// Runs timers, sends handshake packets and collects events. Without the receive thread,
     /// also receives all pending datagrams.
     pub fn poll(&mut self) -> io::Result<()> {
+        if self.inner.broken.load(Ordering::Relaxed)
+            && self
+                .last_auto_rebind
+                .is_none_or(|t| t.elapsed() >= AUTO_REBIND_INTERVAL)
+        {
+            self.last_auto_rebind = Some(Instant::now());
+            self.rebind()?;
+        }
         if self.thread.is_none() {
+            let socket = self.inner.socket();
             loop {
-                match self.inner.socket.recv_from(&mut self.recv_buf) {
+                match socket.recv_from(&mut self.recv_buf) {
                     Ok((n, from)) => {
                         let (mut shared, now) = self.inner.lock_now();
                         shared.core.handle_datagram(now, from, &self.recv_buf[..n]);
@@ -322,13 +403,17 @@ impl Manager {
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     // Windows reports ICMP port unreachable from earlier sends as a receive error.
                     Err(e) if e.kind() == io::ErrorKind::ConnectionReset => self.inner.lock().stats.recv_errors += 1,
+                    Err(e) if socket_is_broken(&e) => {
+                        self.inner.broken.store(true, Ordering::Relaxed);
+                        break;
+                    }
                     Err(e) => return Err(e),
                 }
             }
         }
         let (mut shared, now) = self.inner.lock_now();
         shared.core.update(now);
-        transmit(&mut shared, &self.inner.socket);
+        transmit(&mut shared, &self.inner);
         while let Some(e) = shared.core.poll_event() {
             self.events.push(e);
         }
@@ -388,7 +473,7 @@ impl Manager {
     fn locked<R>(&self, f: impl FnOnce(&mut netlib_core::Manager, Time) -> R) -> R {
         let (mut shared, now) = self.inner.lock_now();
         let r = f(&mut shared.core, now);
-        transmit(&mut shared, &self.inner.socket);
+        transmit(&mut shared, &self.inner);
         r
     }
 }

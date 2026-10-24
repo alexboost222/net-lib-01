@@ -164,6 +164,12 @@ impl Sim {
         self.nodes[node].addr
     }
 
+    /// Moves a node to a new address, like NAT rebinding or a Wi-Fi to LTE switch. Datagrams
+    /// still travelling to the old address are lost.
+    pub fn set_addr(&mut self, node: usize, addr: SocketAddr) {
+        self.nodes[node].addr = addr;
+    }
+
     /// Mutable access to the manager of a node.
     pub fn manager(&mut self, node: usize) -> &mut Manager {
         &mut self.nodes[node].manager

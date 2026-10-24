@@ -12,10 +12,16 @@ pub(crate) const TYPE_CHALLENGE_RESPONSE: u8 = 3;
 pub(crate) const TYPE_ACCEPT: u8 = 4;
 pub(crate) const TYPE_REJECT: u8 = 5;
 pub(crate) const TYPE_DISCONNECT: u8 = 6;
+pub(crate) const TYPE_WHO_ARE_YOU: u8 = 7;
+pub(crate) const TYPE_PATH_CHALLENGE: u8 = 8;
+pub(crate) const TYPE_PATH_RESPONSE: u8 = 9;
 
 pub(crate) const FLAG_ACK: u8 = 0x10;
 pub(crate) const FLAG_PING: u8 = 0x20;
-const KNOWN_DATA_FLAGS: u8 = FLAG_ACK | FLAG_PING;
+pub(crate) const FLAG_MIGRATE: u8 = 0x40;
+const KNOWN_DATA_FLAGS: u8 = FLAG_ACK | FLAG_PING | FLAG_MIGRATE;
+/// Bytes of the migration fields: conn_id u32 + token u64.
+pub(crate) const MIGRATE_LEN: usize = 12;
 
 /// `CONNECT_REQUEST` is padded to this size so that every pre-validation reply is smaller.
 pub(crate) const CONNECT_REQUEST_SIZE: usize = 32;
@@ -242,6 +248,14 @@ pub(crate) enum Control<'a> {
         conn_id: u32,
         data: &'a [u8],
     },
+    /// Reply to DATA from an unknown address: "send your migration fields".
+    WhoAreYou,
+    PathChallenge {
+        challenge: u64,
+    },
+    PathResponse {
+        challenge: u64,
+    },
 }
 
 impl Control<'_> {
@@ -300,6 +314,15 @@ impl Control<'_> {
                 w.u32(conn_id)?;
                 w.varint(data.len() as u64)?;
                 w.bytes(data)?;
+            }
+            Control::WhoAreYou => w.u8(TYPE_WHO_ARE_YOU)?,
+            Control::PathChallenge { challenge } => {
+                w.u8(TYPE_PATH_CHALLENGE)?;
+                w.u64(challenge)?;
+            }
+            Control::PathResponse { challenge } => {
+                w.u8(TYPE_PATH_RESPONSE)?;
+                w.u64(challenge)?;
             }
         }
         Ok(w.pos())
@@ -362,6 +385,9 @@ impl Control<'_> {
                     data: r.bytes(len)?,
                 }
             }
+            TYPE_WHO_ARE_YOU => Control::WhoAreYou,
+            TYPE_PATH_CHALLENGE => Control::PathChallenge { challenge: r.u64()? },
+            TYPE_PATH_RESPONSE => Control::PathResponse { challenge: r.u64()? },
             _ => return None,
         };
         // Trailing garbage makes the packet invalid.
@@ -376,13 +402,18 @@ pub(crate) struct DataHeader {
     /// `(ack, ack_bits, ack_delay)` when `FLAG_ACK` is set; `ack_delay` is encoded
     /// with [`encode_ack_delay`].
     pub(crate) ack: Option<(u16, u16, u8)>,
+    /// `(conn_id, token)` when `FLAG_MIGRATE` is set.
+    pub(crate) migrate: Option<(u32, u64)>,
 }
 
 impl DataHeader {
     pub(crate) fn encode(&self, w: &mut Writer<'_>) -> Result<(), Full> {
-        let mut flags = self.flags & !FLAG_ACK;
+        let mut flags = self.flags & !(FLAG_ACK | FLAG_MIGRATE);
         if self.ack.is_some() {
             flags |= FLAG_ACK;
+        }
+        if self.migrate.is_some() {
+            flags |= FLAG_MIGRATE;
         }
         w.u8(flags | TYPE_DATA)?;
         w.u16(self.seq)?;
@@ -390,6 +421,10 @@ impl DataHeader {
             w.u16(ack)?;
             w.u16(bits)?;
             w.u8(delay)?;
+        }
+        if let Some((conn_id, token)) = self.migrate {
+            w.u32(conn_id)?;
+            w.u64(token)?;
         }
         Ok(())
     }
@@ -406,7 +441,17 @@ impl DataHeader {
         } else {
             None
         };
-        Some(DataHeader { flags, seq, ack })
+        let migrate = if flags & FLAG_MIGRATE != 0 {
+            Some((r.u32()?, r.u64()?))
+        } else {
+            None
+        };
+        Some(DataHeader {
+            flags,
+            seq,
+            ack,
+            migrate,
+        })
     }
 }
 
@@ -484,6 +529,7 @@ mod tests {
             flags: 0,
             seq: 7,
             ack: None,
+            migrate: None,
         }
         .encode(&mut w)
         .unwrap();
@@ -499,6 +545,7 @@ mod tests {
             flags: FLAG_PING,
             seq: 65535,
             ack: Some((65000, 0xbeef, 200)),
+            migrate: None,
         };
         h.encode(&mut w).unwrap();
         let n = w.pos();
@@ -531,7 +578,11 @@ mod tests {
 
     #[test]
     fn data_header_rejects_unknown_flags() {
-        assert!(DataHeader::decode(&mut Reader::new(&[0x40, 0, 0])).is_none());
+        assert!(DataHeader::decode(&mut Reader::new(&[0x80, 0, 0])).is_none());
+        assert!(
+            DataHeader::decode(&mut Reader::new(&[0x40, 0, 0])).is_none(),
+            "truncated migrate fields"
+        );
         assert!(DataHeader::decode(&mut Reader::new(&[0x01, 0, 0])).is_none());
     }
 
@@ -588,6 +639,9 @@ mod tests {
                 conn_id: 5,
                 data: &data,
             },
+            Control::WhoAreYou,
+            Control::PathChallenge { challenge: 77 },
+            Control::PathResponse { challenge: 78 },
         ];
         let mut buf = [0u8; 64];
         for p in packets {

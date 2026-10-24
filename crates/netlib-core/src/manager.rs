@@ -13,8 +13,9 @@ use crate::siphash::{Rng, SipHasher};
 use crate::time::Time;
 use crate::wire::DATA_HEADER_MAX;
 use crate::wire::{
-    BlockHeader, Control, DataHeader, FLAG_PING, REJECT_BY_APP, REJECT_SERVER_FULL, REJECT_VERSION_MISMATCH, Reader,
-    TYPE_DATA, WIRE_VERSION, Writer, decode_ack_delay, encode_ack_delay, encode_addr, varint_len,
+    BlockHeader, Control, DataHeader, FLAG_PING, MIGRATE_LEN, REJECT_BY_APP, REJECT_SERVER_FULL,
+    REJECT_VERSION_MISMATCH, Reader, TYPE_DATA, WIRE_VERSION, Writer, decode_ack_delay, encode_ack_delay, encode_addr,
+    varint_len,
 };
 
 /// Packets remembered for ack processing and RTT measurement.
@@ -119,6 +120,8 @@ pub struct PeerStats {
     pub messages_expired: u64,
     /// Unreliable messages replaced by a newer one with the same `replace_key`.
     pub messages_replaced: u64,
+    /// Address changes of the remote side accepted by this (server) side.
+    pub migrations: u64,
 }
 
 /// Counters that are not tied to a peer.
@@ -132,6 +135,14 @@ pub struct ManagerStats {
     pub invalid_cookies: u64,
     /// CHALLENGE packets sent.
     pub challenges_sent: u64,
+    /// WHO_ARE_YOU replies to DATA from unknown addresses.
+    pub who_are_you_sent: u64,
+    /// Client address changes accepted (before path validation).
+    pub migrations: u64,
+    /// Migration attempts with an invalid token or a replayed seq.
+    pub invalid_migrations: u64,
+    /// Address changes reverted because the new path was not validated in time.
+    pub failed_path_validations: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -180,6 +191,10 @@ struct Peer {
     largest_recv_time: Time,
     /// Last immediate reply to a PING, for rate limiting.
     last_ping_ack: Option<Time>,
+    /// Server side: a new client address waiting for path validation.
+    path: Option<PathCheck>,
+    /// Client side: migration fields are sent until a packet from this seq on is acked.
+    migrate_from: Option<u16>,
     next_seq: u16,
     recv: RecvWindow,
     received_any: bool,
@@ -217,6 +232,8 @@ impl Peer {
             last_ping: now,
             largest_recv_time: now,
             last_ping_ack: None,
+            path: None,
+            migrate_from: None,
             next_seq: 0,
             recv: RecvWindow::default(),
             received_any: false,
@@ -245,6 +262,32 @@ impl Peer {
             State::Connected => PeerState::Connected,
         }
     }
+}
+
+/// A client address change awaiting validation (server side).
+#[derive(Debug, Clone, Copy)]
+struct PathCheck {
+    addr: SocketAddr,
+    old: SocketAddr,
+    challenge: u64,
+    deadline: Time,
+    next_challenge: Time,
+    /// Seq of the packet that triggered the move; another authenticated packet from `addr`
+    /// validates the path as well.
+    trigger_seq: u16,
+    /// Bytes received from and sent to `addr` before validation (anti-amplification).
+    received: usize,
+    sent: usize,
+}
+
+/// Before validation a new address gets at most this multiple of what it sent (RFC 9000).
+const AMPLIFICATION_FACTOR: usize = 3;
+
+/// Token proving knowledge of the session key in a migrating DATA packet.
+fn migrate_token(session_key: u64, conn_id: u32, seq: u16) -> u64 {
+    let mut h = SipHasher::new([session_key, u64::from(conn_id) ^ 0x6d69_6772_6174_6521]);
+    h.write(&seq.to_le_bytes());
+    h.finish()
 }
 
 struct Slot {
@@ -495,6 +538,8 @@ pub struct Manager {
     slots: Vec<Slot>,
     free: Vec<u32>,
     by_addr: BTreeMap<SocketAddr, u32>,
+    /// Server side: connected incoming peers by connection id, for migration.
+    by_conn: BTreeMap<u32, u32>,
     incoming: usize,
     events: EventQueue,
     tx: TxQueue,
@@ -538,6 +583,7 @@ impl Manager {
             slots: Vec::new(),
             free: Vec::new(),
             by_addr: BTreeMap::new(),
+            by_conn: BTreeMap::new(),
             incoming: 0,
             events: EventQueue::default(),
             tx: TxQueue::default(),
@@ -608,6 +654,13 @@ impl Manager {
         slot.generation = slot.generation.wrapping_add(1);
         self.free.push(index);
         self.by_addr.remove(&peer.addr);
+        if let Some(p) = peer.path {
+            self.by_addr.remove(&p.old);
+            self.by_addr.remove(&p.addr);
+        }
+        if !peer.outgoing && self.by_conn.get(&peer.conn_id) == Some(&index) {
+            self.by_conn.remove(&peer.conn_id);
+        }
         if !peer.outgoing {
             self.incoming -= 1;
         }
@@ -646,7 +699,10 @@ impl Manager {
     /// Accepts a pending incoming connection.
     pub fn accept(&mut self, now: Time, id: PeerId) -> Result<(), PeerError> {
         let index = self.index_of(id).ok_or(PeerError::UnknownPeer)?;
-        let conn_id = self.rng.next_nonzero_u32();
+        let mut conn_id = self.rng.next_nonzero_u32();
+        while self.by_conn.contains_key(&conn_id) {
+            conn_id = self.rng.next_nonzero_u32();
+        }
         let session_key = self.rng.next_u64();
         let peer = self.slots[index].peer.as_mut().ok_or(PeerError::UnknownPeer)?;
         if !matches!(peer.state, State::Pending { .. }) {
@@ -658,6 +714,7 @@ impl Manager {
         peer.last_recv = now;
         peer.last_send = now;
         peer.last_ping = now;
+        self.by_conn.insert(conn_id, index as u32);
         let accept = Control::Accept {
             nonce: peer.nonce,
             conn_id,
@@ -803,6 +860,9 @@ impl Manager {
             }) => self.on_accept(now, from, nonce, conn_id, session_key),
             Some(Control::Reject { nonce, reason, data }) => self.on_reject(from, nonce, reason, data),
             Some(Control::Disconnect { conn_id, data }) => self.on_disconnect(from, conn_id, data),
+            Some(Control::WhoAreYou) => self.on_who_are_you(from),
+            Some(Control::PathChallenge { challenge }) => self.on_path_challenge(from, challenge),
+            Some(Control::PathResponse { challenge }) => self.on_path_response(from, challenge),
             None => false,
         };
         if !handled {
@@ -1004,10 +1064,122 @@ impl Manager {
         true
     }
 
-    fn handle_data(&mut self, now: Time, from: SocketAddr, data: &[u8]) {
+    fn on_who_are_you(&mut self, from: SocketAddr) -> bool {
         let Some(&index) = self.by_addr.get(&from) else {
-            self.stats.datagrams_dropped += 1;
-            return;
+            return false;
+        };
+        let Some(peer) = self.slots[index as usize].peer.as_mut() else {
+            return false;
+        };
+        if !peer.outgoing || !matches!(peer.state, State::Connected) {
+            return false;
+        }
+        // Our address changed (NAT rebinding): prove who we are in the next packets.
+        if peer.migrate_from.is_none() {
+            peer.migrate_from = Some(peer.next_seq);
+        }
+        true
+    }
+
+    fn on_path_challenge(&mut self, from: SocketAddr, challenge: u64) -> bool {
+        let Some(&index) = self.by_addr.get(&from) else {
+            return false;
+        };
+        let Some(peer) = self.slots[index as usize].peer.as_mut() else {
+            return false;
+        };
+        if !peer.outgoing || !matches!(peer.state, State::Connected) {
+            return false;
+        }
+        let response = Control::PathResponse { challenge };
+        self.tx
+            .push_control(self.config.mtu, from, &response, Some(&mut peer.stats));
+        true
+    }
+
+    fn on_path_response(&mut self, from: SocketAddr, challenge: u64) -> bool {
+        let Some(&index) = self.by_addr.get(&from) else {
+            return false;
+        };
+        let Some(peer) = self.slots[index as usize].peer.as_mut() else {
+            return false;
+        };
+        let Some(p) = peer.path else {
+            return false;
+        };
+        if p.addr != from || p.challenge != challenge {
+            return false;
+        }
+        peer.path = None;
+        if p.old != p.addr {
+            self.by_addr.remove(&p.old);
+        }
+        true
+    }
+
+    /// DATA from an address no peer has: either a client that moved and proves it with
+    /// migration fields, or one that has to be asked to do so.
+    fn try_migrate(&mut self, now: Time, from: SocketAddr, data: &[u8]) -> Option<u32> {
+        let mut r = Reader::new(data);
+        let header = DataHeader::decode(&mut r)?;
+        let Some((conn_id, token)) = header.migrate else {
+            if self.config.accept_incoming {
+                // One byte in reply to at least three: no amplification.
+                self.tx.push_control(self.config.mtu, from, &Control::WhoAreYou, None);
+                self.stats.who_are_you_sent += 1;
+            }
+            return None;
+        };
+        let &index = self.by_conn.get(&conn_id)?;
+        let challenge = self.rng.next_u64();
+        let peer = self.slots[index as usize].peer.as_mut()?;
+        let valid = !peer.outgoing
+            && matches!(peer.state, State::Connected)
+            && token == migrate_token(peer.session_key, conn_id, header.seq)
+            && peer.recv.check(header.seq) == Received::New
+            && !MsgIter::new(r.rest(), &peer.modes).any(|m| m.is_err());
+        if !valid {
+            self.stats.invalid_migrations += 1;
+            return None;
+        }
+        let mut old = peer.addr;
+        if let Some(p) = peer.path {
+            // Moved again before the previous move was validated.
+            old = p.old;
+            if p.addr != old {
+                self.by_addr.remove(&p.addr);
+            }
+        }
+        let rto = peer.rtt.rto();
+        peer.addr = from;
+        peer.path = Some(PathCheck {
+            addr: from,
+            old,
+            challenge,
+            deadline: now + (rto * 3).max(Duration::from_secs(1)),
+            next_challenge: now + rto,
+            trigger_seq: header.seq,
+            received: 0,
+            sent: 9,
+        });
+        peer.stats.migrations += 1;
+        self.tx
+            .push_control(self.config.mtu, from, &Control::PathChallenge { challenge }, None);
+        self.by_addr.insert(from, index);
+        self.stats.migrations += 1;
+        Some(index)
+    }
+
+    fn handle_data(&mut self, now: Time, from: SocketAddr, data: &[u8]) {
+        let index = match self.by_addr.get(&from) {
+            Some(&index) => index,
+            None => match self.try_migrate(now, from, data) {
+                Some(index) => index,
+                None => {
+                    self.stats.datagrams_dropped += 1;
+                    return;
+                }
+            },
         };
         let id = self.id_of(index);
         let Manager {
@@ -1016,6 +1188,7 @@ impl Manager {
             stats,
             config,
             tx,
+            by_addr,
             ..
         } = self;
         let Some(peer) = slots[index as usize].peer.as_mut() else {
@@ -1025,11 +1198,27 @@ impl Manager {
             stats.datagrams_dropped += 1;
             return;
         }
+        if let Some(p) = &mut peer.path {
+            if p.addr == from {
+                p.received += data.len();
+            }
+        }
         let mut r = Reader::new(data);
         let Some(header) = DataHeader::decode(&mut r) else {
             peer.stats.packets_malformed += 1;
             return;
         };
+        if let (Some(p), Some((conn_id, token))) = (peer.path, header.migrate) {
+            // A second authenticated packet from the new address proves the client is
+            // there, even if the path challenge or its response was lost.
+            let authentic = conn_id == peer.conn_id && token == migrate_token(peer.session_key, conn_id, header.seq);
+            if p.addr == from && header.seq != p.trigger_seq && authentic {
+                peer.path = None;
+                if p.old != p.addr {
+                    by_addr.remove(&p.old);
+                }
+            }
+        }
         let body = r.rest();
         // Validate the whole packet before acting on any of it.
         if MsgIter::new(body, &peer.modes).any(|m| m.is_err()) {
@@ -1122,6 +1311,8 @@ impl Manager {
             slots,
             tx,
             scratch,
+            by_addr,
+            stats,
             ..
         } = self;
         scratch.clear();
@@ -1172,12 +1363,40 @@ impl Manager {
                     if now - peer.last_recv >= config.timeout {
                         scratch.push((index, Some(ReasonRec::Timeout)));
                     }
+                    if let Some(p) = &mut peer.path {
+                        if now < p.deadline && now >= p.next_challenge {
+                            p.next_challenge = now + peer.rtt.rto();
+                            p.sent += 9;
+                            let challenge = Control::PathChallenge { challenge: p.challenge };
+                            tx.push_control(config.mtu, p.addr, &challenge, None);
+                        }
+                    }
+                    if let Some(p) = peer.path {
+                        if now >= p.deadline {
+                            // Not validated: go back to the old address.
+                            peer.path = None;
+                            peer.addr = p.old;
+                            by_addr.remove(&p.addr);
+                            stats.failed_path_validations += 1;
+                        }
+                    }
                 }
             }
         }
         for i in 0..self.scratch.len() {
             let (index, reason) = self.scratch[i];
             self.remove_peer(index, reason);
+        }
+    }
+
+    /// Tells the manager that the local address changed, e.g. after the socket was
+    /// recreated. Outgoing connections prove their identity in the next packets so the
+    /// server moves them to the new address without a reconnect.
+    pub fn local_address_changed(&mut self) {
+        for peer in self.slots.iter_mut().filter_map(|s| s.peer.as_mut()) {
+            if peer.outgoing && matches!(peer.state, State::Connected) && peer.migrate_from.is_none() {
+                peer.migrate_from = Some(peer.next_seq);
+            }
         }
     }
 
@@ -1188,8 +1407,20 @@ impl Manager {
         let Manager { config, slots, tx, .. } = self;
         for slot in slots.iter_mut() {
             if let Some(peer) = slot.peer.as_mut() {
-                if matches!(peer.state, State::Connected) {
-                    flush_peer(peer, now, config, tx);
+                if !matches!(peer.state, State::Connected) {
+                    continue;
+                }
+                // Unvalidated address: send at most 3x what it sent us.
+                let limit = peer
+                    .path
+                    .map(|p| (AMPLIFICATION_FACTOR * p.received).saturating_sub(p.sent));
+                if limit.is_some_and(|l| l < DATA_HEADER_MAX + MIGRATE_LEN) {
+                    continue;
+                }
+                let before = peer.stats.bytes_sent;
+                flush_peer(peer, now, config, tx, limit);
+                if let Some(p) = &mut peer.path {
+                    p.sent += (peer.stats.bytes_sent - before) as usize;
                 }
             }
         }
@@ -1354,6 +1585,12 @@ fn process_acks(peer: &mut Peer, now: Time, ack: u16, bits: u16, ack_delay: Dura
     if peer.largest_acked.is_none_or(|l| seq_newer(ack, l)) {
         peer.largest_acked = Some(ack);
     }
+    if let Some(from) = peer.migrate_from {
+        // The server accepted a packet sent from our new address: migration is complete.
+        if !seq_newer(from, ack) {
+            peer.migrate_from = None;
+        }
+    }
     let Some(largest) = peer.largest_acked else {
         return;
     };
@@ -1402,6 +1639,12 @@ fn record_packet<'a>(
     slot
 }
 
+/// Migration fields for packet `seq` while a client is migrating.
+fn migrate_fields(peer: &Peer, seq: u16) -> Option<(u32, u64)> {
+    (peer.outgoing && peer.migrate_from.is_some())
+        .then(|| (peer.conn_id, migrate_token(peer.session_key, peer.conn_id, seq)))
+}
+
 fn send_ping_ack(peer: &mut Peer, now: Time, mtu: usize, tx: &mut TxQueue) {
     let Some((ack, bits)) = peer.recv.ack() else {
         return;
@@ -1411,6 +1654,7 @@ fn send_ping_ack(peer: &mut Peer, now: Time, mtu: usize, tx: &mut TxQueue) {
         flags: 0,
         seq,
         ack: Some((ack, bits, encode_ack_delay(now - peer.largest_recv_time))),
+        migrate: migrate_fields(peer, seq),
     };
     let start = tx.reserve(mtu);
     let mut w = Writer::new(&mut tx.bytes[start..start + mtu]);
@@ -1544,7 +1788,15 @@ impl Scheduler {
     }
 }
 
-fn flush_peer(peer: &mut Peer, now: Time, config: &Config, tx: &mut TxQueue) {
+/// Flushes one peer. `strict_limit` caps the bytes sent in this flush exactly (used for the
+/// anti-amplification limit); the bandwidth budget may be exceeded by one item.
+fn flush_peer(peer: &mut Peer, now: Time, config: &Config, tx: &mut TxQueue, strict_limit: Option<usize>) {
+    if peer.outgoing && peer.migrate_from.is_none() && now - peer.last_recv >= config.migration_probe {
+        // Silence from the server may mean our address changed: include proof of identity.
+        peer.migrate_from = Some(peer.next_seq);
+    }
+    let migrating = peer.outgoing && peer.migrate_from.is_some();
+    let (conn_id, session_key) = (peer.conn_id, peer.session_key);
     let ping_due = now - peer.last_ping >= config.ping_interval;
     let rto = peer.rtt.rto();
     if let Some(rate) = config.bandwidth {
@@ -1584,16 +1836,20 @@ fn flush_peer(peer: &mut Peer, now: Time, config: &Config, tx: &mut TxQueue) {
     } else {
         None
     };
-    let header_len = if ack.is_some() { DATA_HEADER_MAX } else { 3 };
+    let header_len = if ack.is_some() { DATA_HEADER_MAX } else { 3 } + if migrating { MIGRATE_LEN } else { 0 };
     let mtu = config.mtu;
     let capacity = mtu - header_len;
 
     // ---- phase 1: what goes out now, by effective priority, within the budget ----
     // Highest effective priority first; among equals, the oldest message first.
     cands.sort_unstable_by_key(|c| (core::cmp::Reverse(c.priority), c.enqueued, c.channel, c.order, c.start));
-    let budget = config
+    let tokens = config
         .bandwidth
         .map(|_| usize::try_from(peer.tokens.max(0)).unwrap_or(0));
+    let budget = match (tokens, strict_limit) {
+        (Some(t), Some(l)) => Some(t.min(l.saturating_sub(header_len))),
+        (t, l) => t.or(l.map(|l| l.saturating_sub(header_len))),
+    };
     let mut used = 0usize;
     for (i, c) in cands.iter().enumerate() {
         let ch = &channels[usize::from(c.channel)];
@@ -1605,6 +1861,9 @@ fn flush_peer(peer: &mut Peer, now: Time, config: &Config, tx: &mut TxQueue) {
         if let Some(b) = budget {
             if used >= b {
                 break;
+            }
+            if used + cost > b && !c.splittable && strict_limit.is_some() {
+                continue;
             }
             if used + cost > b && c.splittable {
                 let space = b - used - block_delta_max(reliable);
@@ -1728,7 +1987,14 @@ fn flush_peer(peer: &mut Peer, now: Time, config: &Config, tx: &mut TxQueue) {
         let record = record_packet(sent, channels, stats, seq, now);
         let first_item = i;
         let ok = (|| {
-            DataHeader { flags, seq, ack }.encode(&mut w)?;
+            let migrate = migrating.then(|| (conn_id, migrate_token(session_key, conn_id, seq)));
+            DataHeader {
+                flags,
+                seq,
+                ack,
+                migrate,
+            }
+            .encode(&mut w)?;
             while i < sched.placed.len() && sched.placed[i].packet as usize == packet {
                 let c = cands[sched.placed[i].cand as usize].channel;
                 let ch = &channels[usize::from(c)];

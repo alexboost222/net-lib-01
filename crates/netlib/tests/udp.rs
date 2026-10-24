@@ -10,7 +10,10 @@ fn config(server: bool) -> Config {
     Config {
         protocol_id: 77,
         accept_incoming: server,
-        channels: vec![ChannelConfig::new(DeliveryMode::Unreliable)],
+        channels: vec![
+            ChannelConfig::new(DeliveryMode::Unreliable),
+            ChannelConfig::new(DeliveryMode::ReliableOrdered),
+        ],
         ..Config::default()
     }
 }
@@ -83,4 +86,63 @@ fn echo_over_localhost_without_receive_thread() {
     // Without arrival timestamps the wait for the next poll is part of the RTT, and with it
     // the scheduling noise of `sleep` (tens of ms on CI macOS runners), so only a loose bound.
     assert!(client_rtt < Duration::from_millis(100), "{client_rtt:?}");
+}
+
+#[test]
+fn m2_rebind_keeps_the_connection() {
+    let mut server = Manager::bind("127.0.0.1:0", config(true)).unwrap();
+    let mut client = Manager::bind("127.0.0.1:0", config(false)).unwrap();
+    let peer = client.connect(server.local_addr().unwrap(), &[]).unwrap().unwrap();
+    let mut speer = None;
+    let mut received = Vec::new();
+    let mut sent = 0u32;
+    let mut disconnected = false;
+    let old_addr = client.local_addr().unwrap();
+    let mut new_addr = None;
+    let start = Instant::now();
+    let mut next = start;
+    while start.elapsed() < Duration::from_secs(3) {
+        if new_addr.is_none() && start.elapsed() > Duration::from_secs(1) {
+            client.rebind().unwrap();
+            new_addr = Some(client.local_addr().unwrap());
+        }
+        server.poll().unwrap();
+        let mut accept = Vec::new();
+        while let Some(e) = server.poll_event() {
+            match e {
+                Event::ConnectRequest { peer, .. } => accept.push(peer),
+                Event::Connected { peer, .. } => speer = Some(peer),
+                Event::Message { channel: 1, data, .. } => received.push(u32::from_le_bytes(data.try_into().unwrap())),
+                Event::Disconnected { .. } => disconnected = true,
+                _ => {}
+            }
+        }
+        for p in accept {
+            server.accept(p).unwrap();
+        }
+        server.flush();
+        client.poll().unwrap();
+        while let Some(e) = client.poll_event() {
+            if let Event::Disconnected { .. } = e {
+                disconnected = true;
+            }
+        }
+        if client.peer_state(peer) == Some(PeerState::Connected) && start.elapsed() < Duration::from_millis(2500) {
+            client.send(peer, 1, &sent.to_le_bytes()).unwrap();
+            sent += 1;
+        }
+        client.flush();
+        next += TICK;
+        std::thread::sleep(next.saturating_duration_since(Instant::now()));
+    }
+    let new_addr = new_addr.unwrap();
+    assert_ne!(old_addr, new_addr, "the new socket has a new port");
+    assert!(!disconnected);
+    assert_eq!(server.peer_addr(speer.unwrap()), Some(new_addr));
+    assert_eq!(
+        received,
+        (0..sent).collect::<Vec<_>>(),
+        "reliable stream across the rebind"
+    );
+    assert_eq!(client.socket_stats().rebinds, 1);
 }

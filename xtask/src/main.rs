@@ -39,6 +39,11 @@ const CRITERIA: &[(&str, &str, &str)] = &[
     ("PR4", "M3", "Bandwidth budget within 5%"),
     ("PR5", "M3", "Scheduler cost"),
     ("P1", "M3", "Zero allocations per tick"),
+    ("M1", "M4", "Address change mid-stream without disconnect or data loss"),
+    ("M2", "M4", "Socket recreation (background) without disconnect"),
+    ("M3", "M4", "No hijacking without the token; replays ignored"),
+    ("M4", "M4", "Unvalidated address gets at most 3x the received bytes"),
+    ("M5", "M4", "Recovery time after an address change"),
 ];
 
 const MILESTONES: &[&str] = &["M0", "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10"];
