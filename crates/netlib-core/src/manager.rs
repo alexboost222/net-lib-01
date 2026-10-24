@@ -3077,8 +3077,10 @@ mod tests {
         assert_eq!(s.peer_addr(sp), Some(C));
     }
 
+    type Props = Vec<(&'static str, alloc::string::String)>;
+
     #[derive(Clone, Default)]
-    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<Vec<(&'static str, alloc::string::String)>>>>);
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<Props>>>);
 
     impl LogSink for Capture {
         fn enabled(&self, _: Level) -> bool {
@@ -3205,5 +3207,69 @@ mod tests {
         let want = (peer.last_ping + c.config().ping_interval).min(peer.last_recv + c.config().timeout);
         assert_eq!(c.next_timeout(), Some(want));
         assert!(want > t);
+    }
+
+    /// A DATA packet from the client side with a fresh seq and the given ack fields.
+    fn ack_packet(seq: u16, ack: u16, bits: u16) -> Vec<u8> {
+        let mut p = vec![TYPE_DATA | crate::wire::FLAG_ACK];
+        p.extend_from_slice(&seq.to_le_bytes());
+        p.extend_from_slice(&ack.to_le_bytes());
+        p.extend_from_slice(&bits.to_le_bytes());
+        p.push(0);
+        p
+    }
+
+    #[test]
+    fn acks_count_once_and_trigger_packet_threshold_loss() {
+        let (mut s, _, _, sp, t) = pair(&[DeliveryMode::Unreliable, DeliveryMode::ReliableOrdered], |_| {});
+        let mut seqs = Vec::new();
+        for i in 0..6u8 {
+            s.send(sp, 1, &[i]).unwrap();
+            s.flush(t);
+            seqs.push(seq_of(&drain(&mut s)[0]));
+        }
+        let before = s.peer_stats(sp).unwrap().clone();
+        let stat = |s: &Manager| {
+            let p = s.peer_stats(sp).unwrap();
+            (
+                p.packets_acked - before.packets_acked,
+                p.packets_lost - before.packets_lost,
+            )
+        };
+        // Only the fifth packet arrives: the first two are PACKET_THRESHOLD behind it.
+        s.handle_datagram(t, C, &ack_packet(1000, seqs[4], 0));
+        assert_eq!(stat(&s), (1, 2));
+        // The same ack again changes nothing.
+        s.handle_datagram(t, C, &ack_packet(1001, seqs[4], 0));
+        assert_eq!(stat(&s), (1, 2));
+        // The third and fourth arrived too: bits 2 and 1 below the sixth (bit 0 is the fifth).
+        s.handle_datagram(t, C, &ack_packet(1002, seqs[5], 0b111));
+        assert_eq!(stat(&s), (4, 2));
+        // The lost messages are retransmitted, the others are not.
+        s.flush(t);
+        assert_eq!(
+            s.peer_stats(sp).unwrap().messages_retransmitted - before.messages_retransmitted,
+            2
+        );
+    }
+
+    #[test]
+    fn many_tiny_messages_fit_their_packets() {
+        let (mut s, mut c, id, _, t) = pair(&[DeliveryMode::Unreliable, DeliveryMode::ReliableOrdered], |_| {});
+        for i in 0..600u32 {
+            c.send(id, (i % 2) as u8, &[i as u8]).unwrap();
+        }
+        c.flush(t);
+        let pkts = drain(&mut c);
+        assert!(pkts.iter().all(|p| p.len() <= c.config().mtu));
+        deliver(&mut s, t, C, &pkts);
+        let mut got = 0;
+        while let Some(e) = s.poll_event() {
+            got += usize::from(matches!(e, Event::Message { .. }));
+        }
+        assert_eq!(got, 600);
+        // Dense packing: one byte of payload costs about one byte of framing.
+        let total: usize = pkts.iter().map(Vec::len).sum();
+        assert!(total < 600 * 3, "{total} bytes in {} packets", pkts.len());
     }
 }
