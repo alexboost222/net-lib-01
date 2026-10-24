@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- .NET Standard 2.1: usable from .NET, Mono and Unity (Mono and IL2CPP) without depending on any of them. -->
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <LangVersion>9.0</LangVersion>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <RootNamespace>NetLib</RootNamespace>
+    <AssemblyName>NetLib</AssemblyName>
+    <Version>0.0.1</Version>
+    <Description>C# binding of netlib, a UDP transport for fast-paced multiplayer games.</Description>
+    <PackageLicenseExpression>MIT OR Apache-2.0</PackageLicenseExpression>
+  </PropertyGroup>
+</Project>

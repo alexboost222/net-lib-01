@@ -40,6 +40,39 @@ jobs:
           cargo run -q -p netlib --example echo_client -- 127.0.0.1:7777 2 | tee echo.txt
           grep -q "echoed" echo.txt
 
+  ffi:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: C header is up to date
+        if: runner.os == 'Linux'
+        run: cargo xtask header --check
+      - run: cargo build -p netlib-ffi
+      - name: C smoke test
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cc -Wall -Wextra -Werror -std=c99 bindings/c/examples/smoke.c -Ltarget/debug -lnetlib_ffi -o smoke
+          LD_LIBRARY_PATH=target/debug DYLD_LIBRARY_PATH=target/debug ./smoke
+      - name: .NET binding tests
+        run: dotnet test bindings/dotnet/NetLib.Tests --nologo
+      - name: C# client against the Rust echo server
+        shell: bash
+        run: |
+          cargo build -p netlib --examples
+          cargo run -q -p netlib --example echo_server -- 127.0.0.1:7777 &
+          sleep 2
+          dotnet run --project bindings/dotnet/examples/EchoClient -- 127.0.0.1:7777 2
+
   no-std:
     runs-on: ubuntu-latest
     steps:
@@ -70,6 +103,10 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - run: cargo build -p netlib-ffi
       - run: cargo xtask report --all
         continue-on-error: true
       - run: cat target/report.md >> "$GITHUB_STEP_SUMMARY"

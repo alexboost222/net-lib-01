@@ -1,0 +1,24 @@
+[package]
+name = "netlib-ffi"
+description = "C ABI of netlib for engines and other languages"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+netlib.workspace = true
+
+# The C ABI needs `unsafe`; every unsafe block documents its invariant.
+[lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"

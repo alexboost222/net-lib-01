@@ -1,0 +1,12 @@
+<Project>
+  <!-- Copies the native library built by cargo next to the managed assemblies. -->
+  <PropertyGroup>
+    <NetlibProfile Condition="'$(NetlibProfile)' == ''">debug</NetlibProfile>
+    <NetlibNativeDir Condition="'$(NetlibNativeDir)' == ''">$(MSBuildThisFileDirectory)../../target/$(NetlibProfile)/</NetlibNativeDir>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="$(NetlibNativeDir)libnetlib_ffi.so" Condition="Exists('$(NetlibNativeDir)libnetlib_ffi.so')" CopyToOutputDirectory="PreserveNewest" Visible="false" />
+    <None Include="$(NetlibNativeDir)libnetlib_ffi.dylib" Condition="Exists('$(NetlibNativeDir)libnetlib_ffi.dylib')" CopyToOutputDirectory="PreserveNewest" Visible="false" />
+    <None Include="$(NetlibNativeDir)netlib_ffi.dll" Condition="Exists('$(NetlibNativeDir)netlib_ffi.dll')" CopyToOutputDirectory="PreserveNewest" Visible="false" />
+  </ItemGroup>
+</Project>

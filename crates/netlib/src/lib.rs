@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 pub use netlib_core::{
     ChannelConfig, Config, ConfigError, ConnectError, DeliveryMode, DisconnectReason, Event, ManagerStats, PeerError,
-    PeerId, PeerState, PeerStats, SendError, Time,
+    PeerId, PeerState, PeerStats, SendError, SendOptions, Time,
 };
 
 /// Errors of [`Manager::bind`].
@@ -453,6 +453,11 @@ impl Manager {
     /// Queues a message for the next [`flush`](Self::flush).
     pub fn send(&mut self, peer: PeerId, channel: u8, data: &[u8]) -> Result<(), SendError> {
         self.inner.lock().core.send(peer, channel, data)
+    }
+
+    /// Queues a message with per-message priority, TTL or replace key.
+    pub fn send_with(&mut self, peer: PeerId, channel: u8, data: &[u8], options: SendOptions) -> Result<(), SendError> {
+        self.inner.lock().core.send_with(peer, channel, data, options)
     }
 
     /// Packs queued messages into datagrams and sends them.
