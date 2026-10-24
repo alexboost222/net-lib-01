@@ -11,11 +11,14 @@
 //! - event data stays valid until the next call to `netlib_poll` or `netlib_manager_destroy`.
 #![allow(clippy::missing_safety_doc)]
 
+use std::collections::VecDeque;
 use std::ffi::{CStr, c_char};
 use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use netlib::log::{Level, LogSink, Record, Value};
 use netlib::{
     BindError, ChannelConfig, Config, ConnectError, DeliveryMode, DisconnectReason, DriverConfig, Event, Manager,
     PeerError, PeerId, SendError, SendOptions,
@@ -87,9 +90,134 @@ pub const NETLIB_REASON_VERSION_MISMATCH: u32 = 7;
 /// See [`NETLIB_REASON_TIMEOUT`].
 pub const NETLIB_REASON_RECONNECTED: u32 = 8;
 
+/// `NetlibLogProperty::kind` values.
+pub const NETLIB_LOG_U64: u8 = 0;
+/// See [`NETLIB_LOG_U64`].
+pub const NETLIB_LOG_I64: u8 = 1;
+/// See [`NETLIB_LOG_U64`]; durations are milliseconds.
+pub const NETLIB_LOG_F64: u8 = 2;
+/// See [`NETLIB_LOG_U64`]; the value is in `u` (0 or 1).
+pub const NETLIB_LOG_BOOL: u8 = 3;
+/// See [`NETLIB_LOG_U64`]; text and addresses.
+pub const NETLIB_LOG_STR: u8 = 4;
+
+/// Log records waiting in native memory at most; newer ones are dropped and counted.
+const LOG_QUEUE_LIMIT: usize = 8192;
+
+enum OwnedValue {
+    U64(u64),
+    I64(i64),
+    F64(f64),
+    Bool(bool),
+    Str(String),
+}
+
+struct OwnedRecord {
+    level: Level,
+    id: u32,
+    time_us: u64,
+    template: &'static str,
+    props: Vec<(&'static str, OwnedValue)>,
+}
+
+#[derive(Default)]
+struct LogQueue {
+    records: VecDeque<OwnedRecord>,
+    dropped: u64,
+}
+
+/// Copies log records into a queue that `netlib_poll` hands to `netlib_next_log`.
+struct QueueSink {
+    queue: Arc<Mutex<LogQueue>>,
+    min: Level,
+}
+
+impl LogSink for QueueSink {
+    fn enabled(&self, level: Level) -> bool {
+        level >= self.min
+    }
+
+    fn log(&mut self, r: &Record<'_>) {
+        let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        if q.records.len() >= LOG_QUEUE_LIMIT {
+            q.dropped += 1;
+            return;
+        }
+        let props = r
+            .properties
+            .iter()
+            .map(|p| {
+                let v = match p.value {
+                    Value::U64(v) => OwnedValue::U64(v),
+                    Value::I64(v) => OwnedValue::I64(v),
+                    Value::F64(v) => OwnedValue::F64(v),
+                    Value::Bool(v) => OwnedValue::Bool(v),
+                    Value::Str(v) => OwnedValue::Str(v.to_string()),
+                    Value::Addr(a) => OwnedValue::Str(a.to_string()),
+                    Value::Duration(d) => OwnedValue::F64(netlib::log::duration_ms(d)),
+                };
+                (p.name, v)
+            })
+            .collect();
+        q.records.push_back(OwnedRecord {
+            level: r.template.level,
+            id: r.template.id,
+            time_us: r.time_us,
+            template: r.template.text,
+            props,
+        });
+    }
+}
+
+/// One property of a log record. Strings are UTF-8 without a terminator.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct NetlibLogProperty {
+    /// PascalCase name.
+    pub name: *const u8,
+    /// Length of `name`.
+    pub name_len: u32,
+    /// One of the `NETLIB_LOG_*` constants.
+    pub kind: u8,
+    /// `NETLIB_LOG_U64` and `NETLIB_LOG_BOOL` values.
+    pub u: u64,
+    /// `NETLIB_LOG_I64` values.
+    pub i: i64,
+    /// `NETLIB_LOG_F64` values.
+    pub f: f64,
+    /// `NETLIB_LOG_STR` values.
+    pub str: *const u8,
+    /// Length of `str`.
+    pub str_len: u32,
+}
+
+/// A structured log record: a message template and its property values.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct NetlibLogRecord {
+    /// 0 trace, 1 debug, 2 info, 3 warn, 4 error.
+    pub level: u8,
+    /// Stable id of the template (see docs/LOG_EVENTS.md).
+    pub event_id: u32,
+    /// Microseconds since the manager was created.
+    pub time_us: u64,
+    /// Message template, UTF-8.
+    pub template_: *const u8,
+    /// Length of `template_`.
+    pub template_len: u32,
+    /// Properties in template order; valid until the next `netlib_next_log` or `netlib_poll`.
+    pub properties: *const NetlibLogProperty,
+    /// Number of properties.
+    pub property_count: u32,
+}
+
 /// Opaque manager handle.
 pub struct NetlibManager {
     manager: Manager,
+    logs: Option<Arc<Mutex<LogQueue>>>,
+    log_batch: VecDeque<OwnedRecord>,
+    log_current: Option<OwnedRecord>,
+    log_props: Vec<NetlibLogProperty>,
 }
 
 /// One channel.
@@ -280,6 +408,52 @@ unsafe fn manager<'a>(m: *mut NetlibManager) -> Option<&'a mut Manager> {
     unsafe { m.as_mut() }.map(|m| &mut m.manager)
 }
 
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+
+    #[test]
+    fn l_logs_cross_the_c_abi() {
+        let c = {
+            let mut c = std::mem::MaybeUninit::<NetlibConfig>::uninit();
+            // SAFETY: valid out pointer.
+            unsafe { netlib_config_default(c.as_mut_ptr()) };
+            // SAFETY: initialised above.
+            unsafe { c.assume_init() }
+        };
+        let addr = std::ffi::CString::new("127.0.0.1:0").unwrap();
+        let target = std::ffi::CString::new("127.0.0.1:9").unwrap();
+        let mut m = std::ptr::null_mut();
+        let mut peer = 0;
+        // SAFETY: valid pointers; the record is read before the next call.
+        unsafe {
+            assert_eq!(netlib_manager_create(&c, addr.as_ptr(), &mut m), NETLIB_OK);
+            assert_eq!(netlib_set_log_level(m, 1), NETLIB_OK);
+            assert_eq!(
+                netlib_connect(m, target.as_ptr(), std::ptr::null(), 0, &mut peer),
+                NETLIB_OK
+            );
+            assert_eq!(netlib_poll(m), NETLIB_OK);
+            let mut r = std::mem::zeroed::<NetlibLogRecord>();
+            assert_eq!(netlib_next_log(m, &mut r), 1);
+            let template =
+                std::str::from_utf8(std::slice::from_raw_parts(r.template_, r.template_len as usize)).unwrap();
+            assert_eq!(template, "Connecting to {RemoteEndpoint} as peer {PeerId}");
+            assert_eq!(r.event_id, netlib::log::event_id(template));
+            assert_eq!(r.level, 2);
+            let props = std::slice::from_raw_parts(r.properties, r.property_count as usize);
+            assert_eq!(props.len(), 2);
+            assert_eq!(props[0].kind, NETLIB_LOG_STR);
+            let ep = std::slice::from_raw_parts(props[0].str, props[0].str_len as usize);
+            assert_eq!(ep, b"127.0.0.1:9");
+            assert_eq!((props[1].kind, props[1].u), (NETLIB_LOG_U64, peer));
+            assert_eq!(netlib_next_log(m, &mut r), 0);
+            assert_eq!(netlib_set_log_level(m, -1), NETLIB_OK);
+            netlib_manager_destroy(m);
+        }
+    }
+}
+
 /// Fills `out` with the default configuration (client, one unreliable channel).
 ///
 /// # Safety
@@ -385,7 +559,13 @@ pub unsafe extern "C" fn netlib_manager_create(
         };
         match Manager::bind_with(addr, cfg, driver) {
             Ok(manager) => {
-                let ptr = Box::into_raw(Box::new(NetlibManager { manager }));
+                let ptr = Box::into_raw(Box::new(NetlibManager {
+                    manager,
+                    logs: None,
+                    log_batch: VecDeque::new(),
+                    log_current: None,
+                    log_props: Vec::new(),
+                }));
                 // SAFETY: `out` is non-null and valid for writes per the contract.
                 unsafe { *out = ptr };
                 NETLIB_OK
@@ -416,10 +596,115 @@ pub unsafe extern "C" fn netlib_manager_destroy(m: *mut NetlibManager) {
 pub unsafe extern "C" fn netlib_poll(m: *mut NetlibManager) -> i32 {
     guard(|| {
         // SAFETY: per the contract.
-        let Some(m) = (unsafe { manager(m) }) else {
+        let Some(h) = (unsafe { m.as_mut() }) else {
             return NETLIB_ERR_INVALID_ARGUMENT;
         };
-        m.poll().map_or(NETLIB_ERR_IO, |()| NETLIB_OK)
+        let r = h.manager.poll().map_or(NETLIB_ERR_IO, |()| NETLIB_OK);
+        h.log_current = None;
+        h.log_batch.clear();
+        if let Some(q) = &h.logs {
+            let mut q = q.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::swap(&mut q.records, &mut h.log_batch);
+        }
+        r
+    })
+}
+
+/// Enables structured logs from `level` up (0 trace .. 4 error), or disables them with a
+/// negative level. Records are collected by `netlib_poll` and read with `netlib_next_log`.
+///
+/// # Safety
+/// `m` must be a live manager.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn netlib_set_log_level(m: *mut NetlibManager, level: i32) -> i32 {
+    guard(|| {
+        // SAFETY: per the contract.
+        let Some(h) = (unsafe { m.as_mut() }) else {
+            return NETLIB_ERR_INVALID_ARGUMENT;
+        };
+        let level = match level {
+            l if l < 0 => None,
+            0 => Some(Level::Trace),
+            1 => Some(Level::Debug),
+            2 => Some(Level::Info),
+            3 => Some(Level::Warn),
+            4 => Some(Level::Error),
+            _ => return NETLIB_ERR_INVALID_ARGUMENT,
+        };
+        match level {
+            None => {
+                h.manager.set_log_sink(None);
+                h.logs = None;
+            }
+            Some(min) => {
+                let queue = h.logs.get_or_insert_with(Arc::default).clone();
+                h.manager.set_log_sink(Some(Box::new(QueueSink { queue, min })));
+            }
+        }
+        NETLIB_OK
+    })
+}
+
+/// Takes the next log record collected by `netlib_poll`. Returns 1 if `out` was filled, 0 if
+/// there are no more. The record stays valid until the next call or `netlib_poll`.
+///
+/// # Safety
+/// `m` must be a live manager and `out` valid for writes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn netlib_next_log(m: *mut NetlibManager, out: *mut NetlibLogRecord) -> i32 {
+    guard(|| {
+        // SAFETY: per the contract.
+        let (Some(h), Some(out)) = (unsafe { m.as_mut() }, unsafe { out.as_mut() }) else {
+            return NETLIB_ERR_INVALID_ARGUMENT;
+        };
+        h.log_current = h.log_batch.pop_front();
+        let Some(r) = &h.log_current else {
+            return 0;
+        };
+        h.log_props.clear();
+        for (name, v) in &r.props {
+            let mut p = NetlibLogProperty {
+                name: name.as_ptr(),
+                name_len: name.len() as u32,
+                kind: NETLIB_LOG_U64,
+                u: 0,
+                i: 0,
+                f: 0.0,
+                str: std::ptr::null(),
+                str_len: 0,
+            };
+            match v {
+                OwnedValue::U64(x) => p.u = *x,
+                OwnedValue::I64(x) => {
+                    p.kind = NETLIB_LOG_I64;
+                    p.i = *x;
+                }
+                OwnedValue::F64(x) => {
+                    p.kind = NETLIB_LOG_F64;
+                    p.f = *x;
+                }
+                OwnedValue::Bool(x) => {
+                    p.kind = NETLIB_LOG_BOOL;
+                    p.u = u64::from(*x);
+                }
+                OwnedValue::Str(s) => {
+                    p.kind = NETLIB_LOG_STR;
+                    p.str = s.as_ptr();
+                    p.str_len = s.len() as u32;
+                }
+            }
+            h.log_props.push(p);
+        }
+        *out = NetlibLogRecord {
+            level: r.level as u8,
+            event_id: r.id,
+            time_us: r.time_us,
+            template_: r.template.as_ptr(),
+            template_len: r.template.len() as u32,
+            properties: h.log_props.as_ptr(),
+            property_count: h.log_props.len() as u32,
+        };
+        1
     })
 }
 

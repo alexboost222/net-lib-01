@@ -165,6 +165,31 @@
 #define NETLIB_REASON_RECONNECTED 8
 
 /**
+ * `NetlibLogProperty::kind` values.
+ */
+#define NETLIB_LOG_U64 0
+
+/**
+ * See [`NETLIB_LOG_U64`].
+ */
+#define NETLIB_LOG_I64 1
+
+/**
+ * See [`NETLIB_LOG_U64`]; durations are milliseconds.
+ */
+#define NETLIB_LOG_F64 2
+
+/**
+ * See [`NETLIB_LOG_U64`]; the value is in `u` (0 or 1).
+ */
+#define NETLIB_LOG_BOOL 3
+
+/**
+ * See [`NETLIB_LOG_U64`]; text and addresses.
+ */
+#define NETLIB_LOG_STR 4
+
+/**
  * Opaque manager handle.
  */
 typedef struct NetlibManager NetlibManager;
@@ -248,6 +273,78 @@ typedef struct NetlibConfig {
    */
   uint32_t max_reliable_queue;
 } NetlibConfig;
+
+/**
+ * One property of a log record. Strings are UTF-8 without a terminator.
+ */
+typedef struct NetlibLogProperty {
+  /**
+   * PascalCase name.
+   */
+  const uint8_t *name;
+  /**
+   * Length of `name`.
+   */
+  uint32_t name_len;
+  /**
+   * One of the `NETLIB_LOG_*` constants.
+   */
+  uint8_t kind;
+  /**
+   * `NETLIB_LOG_U64` and `NETLIB_LOG_BOOL` values.
+   */
+  uint64_t u;
+  /**
+   * `NETLIB_LOG_I64` values.
+   */
+  int64_t i;
+  /**
+   * `NETLIB_LOG_F64` values.
+   */
+  double f;
+  /**
+   * `NETLIB_LOG_STR` values.
+   */
+  const uint8_t *str;
+  /**
+   * Length of `str`.
+   */
+  uint32_t str_len;
+} NetlibLogProperty;
+
+/**
+ * A structured log record: a message template and its property values.
+ */
+typedef struct NetlibLogRecord {
+  /**
+   * 0 trace, 1 debug, 2 info, 3 warn, 4 error.
+   */
+  uint8_t level;
+  /**
+   * Stable id of the template (see docs/LOG_EVENTS.md).
+   */
+  uint32_t event_id;
+  /**
+   * Microseconds since the manager was created.
+   */
+  uint64_t time_us;
+  /**
+   * Message template, UTF-8.
+   */
+  const uint8_t *template_;
+  /**
+   * Length of `template_`.
+   */
+  uint32_t template_len;
+  /**
+   * Properties in template order; valid until the next `netlib_next_log` or `netlib_poll`.
+   */
+  const struct NetlibLogProperty *properties;
+  /**
+   * Number of properties.
+   */
+  uint32_t property_count;
+} NetlibLogRecord;
 
 /**
  * A socket address.
@@ -399,6 +496,24 @@ void netlib_manager_destroy(struct NetlibManager *m);
  * `m` must be a live manager.
  */
 int32_t netlib_poll(struct NetlibManager *m);
+
+/**
+ * Enables structured logs from `level` up (0 trace .. 4 error), or disables them with a
+ * negative level. Records are collected by `netlib_poll` and read with `netlib_next_log`.
+ *
+ * # Safety
+ * `m` must be a live manager.
+ */
+int32_t netlib_set_log_level(struct NetlibManager *m, int32_t level);
+
+/**
+ * Takes the next log record collected by `netlib_poll`. Returns 1 if `out` was filled, 0 if
+ * there are no more. The record stays valid until the next call or `netlib_poll`.
+ *
+ * # Safety
+ * `m` must be a live manager and `out` valid for writes.
+ */
+int32_t netlib_next_log(struct NetlibManager *m, struct NetlibLogRecord *out);
 
 /**
  * Takes the next event collected by `netlib_poll`. Returns 1 if `out` was filled, 0 if

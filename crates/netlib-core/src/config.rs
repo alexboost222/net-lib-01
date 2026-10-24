@@ -120,6 +120,8 @@ pub struct Config {
     /// Client side: after this long without packets from the server, outgoing packets carry
     /// migration fields (12 bytes) in case our address changed unnoticed.
     pub migration_probe: Duration,
+    /// Interval of the periodic per-peer statistics log event; `None` disables it.
+    pub stats_interval: Option<Duration>,
 }
 
 impl Default for Config {
@@ -144,6 +146,7 @@ impl Default for Config {
             bandwidth: None,
             starvation_time: Duration::from_millis(500),
             migration_probe: Duration::from_millis(1500),
+            stats_interval: Some(Duration::from_secs(5)),
         }
     }
 }

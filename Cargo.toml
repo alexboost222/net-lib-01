@@ -11,6 +11,7 @@ repository = "https://github.com/alexboost222/net-lib-01"
 
 [workspace.dependencies]
 netlib-core = { path = "crates/netlib-core", version = "0.0.1" }
+netlib-log = { path = "crates/netlib-log", version = "0.0.1" }
 netlib = { path = "crates/netlib", version = "0.0.1" }
 netlib-sim = { path = "crates/netlib-sim", version = "0.0.1" }
 

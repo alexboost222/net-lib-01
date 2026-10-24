@@ -1,0 +1,16 @@
+[package]
+name = "netlib-log"
+description = "Structured logging with message templates for netlib"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Remove Trace (and Debug) events at compile time.
+strip-trace = []
+strip-debug = ["strip-trace"]
+
+[lints]
+workspace = true

@@ -17,6 +17,7 @@ use crate::wire::{
     REJECT_VERSION_MISMATCH, Reader, TYPE_DATA, WIRE_VERSION, Writer, decode_ack_delay, encode_ack_delay, encode_addr,
     varint_len,
 };
+use netlib_log::{Level, LogSink, Record, netlog};
 
 /// Packets remembered for ack processing and RTT measurement.
 const SENT_RING: usize = 256;
@@ -177,6 +178,8 @@ enum State {
 }
 
 struct Peer {
+    /// `PeerId::to_bits` of this peer, for logs.
+    id: u64,
     addr: SocketAddr,
     outgoing: bool,
     state: State,
@@ -195,6 +198,9 @@ struct Peer {
     path: Option<PathCheck>,
     /// Client side: migration fields are sent until a packet from this seq on is acked.
     migrate_from: Option<u16>,
+    /// Periodic statistics: time and counters of the last report.
+    last_stats: Time,
+    stats_base: PeerStats,
     next_seq: u16,
     recv: RecvWindow,
     received_any: bool,
@@ -220,6 +226,7 @@ struct Peer {
 impl Peer {
     fn new(config: &Config, addr: SocketAddr, outgoing: bool, state: State, nonce: u64, now: Time) -> Self {
         Peer {
+            id: 0,
             addr,
             outgoing,
             state,
@@ -234,6 +241,8 @@ impl Peer {
             last_ping_ack: None,
             path: None,
             migrate_from: None,
+            last_stats: now,
+            stats_base: PeerStats::default(),
             next_seq: 0,
             recv: RecvWindow::default(),
             received_any: false,
@@ -288,6 +297,39 @@ fn migrate_token(session_key: u64, conn_id: u32, seq: u16) -> u64 {
     let mut h = SipHasher::new([session_key, u64::from(conn_id) ^ 0x6d69_6772_6174_6521]);
     h.write(&seq.to_le_bytes());
     h.finish()
+}
+
+/// The manager's log sink; without one, logging costs a branch.
+#[derive(Default)]
+pub(crate) struct Logger {
+    sink: Option<alloc::boxed::Box<dyn LogSink + Send>>,
+}
+
+impl LogSink for Logger {
+    #[inline]
+    fn enabled(&self, level: Level) -> bool {
+        self.sink.as_ref().is_some_and(|s| s.enabled(level))
+    }
+
+    fn log(&mut self, record: &Record<'_>) {
+        if let Some(s) = &mut self.sink {
+            s.log(record);
+        }
+    }
+}
+
+/// Text of a disconnect reason, for logs.
+fn reason_text(r: &ReasonRec) -> &'static str {
+    match r {
+        ReasonRec::Timeout => "timeout",
+        ReasonRec::Remote(..) => "closed by the remote side",
+        ReasonRec::Local => "closed locally",
+        ReasonRec::ConnectTimeout => "connect timeout",
+        ReasonRec::Rejected(..) => "rejected",
+        ReasonRec::ServerFull => "server full",
+        ReasonRec::VersionMismatch => "version mismatch",
+        ReasonRec::Reconnected => "reconnected",
+    }
 }
 
 struct Slot {
@@ -547,6 +589,7 @@ pub struct Manager {
     stats: ManagerStats,
     /// Latest time passed to any call; used as the enqueue time of `send`.
     now_hint: Time,
+    log: Logger,
 }
 
 fn cookie_mac(key: [u64; 2], addr: &SocketAddr, nonce: u64, timestamp: u32, protocol_id: u32) -> u64 {
@@ -590,12 +633,19 @@ impl Manager {
             scratch: Vec::new(),
             stats: ManagerStats::default(),
             now_hint: now,
+            log: Logger::default(),
         })
     }
 
     /// The configuration.
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Sets the log sink, or removes it with `None`. Events follow the catalog in
+    /// `docs/LOG_EVENTS.md`; their times are microseconds on the manager's clock.
+    pub fn set_log_sink(&mut self, sink: Option<alloc::boxed::Box<dyn LogSink + Send>>) {
+        self.log.sink = sink;
     }
 
     /// Global counters.
@@ -623,17 +673,27 @@ impl Manager {
         self.slots[self.index_of(id)?].peer.as_ref()
     }
 
-    fn insert_peer(&mut self, peer: Peer) -> u32 {
+    fn insert_peer(&mut self, mut peer: Peer) -> u32 {
         let addr = peer.addr;
         if !peer.outgoing {
             self.incoming += 1;
         }
         let index = match self.free.pop() {
             Some(i) => {
+                peer.id = PeerId {
+                    index: i,
+                    generation: self.slots[i as usize].generation,
+                }
+                .to_bits();
                 self.slots[i as usize].peer = Some(peer);
                 i
             }
             None => {
+                peer.id = PeerId {
+                    index: self.slots.len() as u32,
+                    generation: 0,
+                }
+                .to_bits();
                 self.slots.push(Slot {
                     generation: 0,
                     peer: Some(peer),
@@ -665,6 +725,15 @@ impl Manager {
             self.incoming -= 1;
         }
         if let Some(reason) = reason {
+            netlog!(
+                self.log,
+                Info,
+                self.now_hint.as_micros(),
+                "Peer {PeerId} at {RemoteEndpoint} disconnected: {Reason}",
+                PeerId = peer.id,
+                RemoteEndpoint = peer.addr,
+                Reason = reason_text(&reason)
+            );
             self.events.push(EventRec::Disconnected { peer: id, reason });
         }
     }
@@ -693,7 +762,16 @@ impl Manager {
         self.tx
             .push_control(self.config.mtu, addr, &request, Some(&mut peer.stats));
         let index = self.insert_peer(peer);
-        Ok(self.id_of(index))
+        let id = self.id_of(index);
+        netlog!(
+            self.log,
+            Info,
+            now.as_micros(),
+            "Connecting to {RemoteEndpoint} as peer {PeerId}",
+            RemoteEndpoint = addr,
+            PeerId = id.to_bits()
+        );
+        Ok(id)
     }
 
     /// Accepts a pending incoming connection.
@@ -715,6 +793,15 @@ impl Manager {
         peer.last_send = now;
         peer.last_ping = now;
         self.by_conn.insert(conn_id, index as u32);
+        netlog!(
+            self.log,
+            Info,
+            now.as_micros(),
+            "Peer {PeerId} connected from {RemoteEndpoint} as connection {ConnId}",
+            PeerId = peer.id,
+            RemoteEndpoint = peer.addr,
+            ConnId = conn_id
+        );
         let accept = Control::Accept {
             nonce: peer.nonce,
             conn_id,
@@ -745,6 +832,14 @@ impl Manager {
             data,
         };
         self.tx.push_control(self.config.mtu, peer.addr, &reject, None);
+        netlog!(
+            self.log,
+            Info,
+            self.now_hint.as_micros(),
+            "Rejected connection request {PeerId} from {RemoteEndpoint}",
+            PeerId = peer.id,
+            RemoteEndpoint = peer.addr
+        );
         self.remove_peer(index as u32, None);
         Ok(())
     }
@@ -802,6 +897,15 @@ impl Manager {
             }
             // A sequenced channel replaces its queue, so it never fills up.
             if ch.mode != DeliveryMode::ReliableSequenced && ch.reliable_queue_len() >= config.max_reliable_queue {
+                netlog!(
+                    self.log,
+                    Warn,
+                    now.as_micros(),
+                    "Reliable queue of channel {Channel} to peer {PeerId} is full: {Queued} messages wait for acks",
+                    Channel = channel,
+                    PeerId = peer.id,
+                    Queued = ch.reliable_queue_len()
+                );
                 return Err(SendError::QueueFull);
             }
             ch.queue_reliable(data, config.single_reliable_limit(), now, priority);
@@ -888,6 +992,14 @@ impl Manager {
                 data: &[],
             };
             self.tx.push_control(mtu, from, &reject, None);
+            netlog!(
+                self.log,
+                Warn,
+                now.as_micros(),
+                "Rejected {RemoteEndpoint}: wire version {Version} is not supported",
+                RemoteEndpoint = from,
+                Version = version
+            );
             return true;
         }
         if existing.is_none() && self.incoming >= self.config.max_incoming {
@@ -897,6 +1009,14 @@ impl Manager {
                 data: &[],
             };
             self.tx.push_control(mtu, from, &reject, None);
+            netlog!(
+                self.log,
+                Info,
+                now.as_micros(),
+                "Rejected {RemoteEndpoint}: server full with {Incoming} peers",
+                RemoteEndpoint = from,
+                Incoming = self.incoming
+            );
             return true;
         }
         let timestamp = self.now_secs(now);
@@ -904,6 +1024,13 @@ impl Manager {
         self.tx
             .push_control(mtu, from, &Control::Challenge { nonce, timestamp, mac }, None);
         self.stats.challenges_sent += 1;
+        netlog!(
+            self.log,
+            Trace,
+            now.as_micros(),
+            "Challenge sent to {RemoteEndpoint}",
+            RemoteEndpoint = from
+        );
         true
     }
 
@@ -954,6 +1081,13 @@ impl Manager {
         let fresh = timestamp <= now_secs && u64::from(now_secs - timestamp) <= self.config.cookie_lifetime.as_secs();
         if !fresh || mac != cookie_mac(self.cookie_key, &from, nonce, timestamp, self.config.protocol_id) {
             self.stats.invalid_cookies += 1;
+            netlog!(
+                self.log,
+                Debug,
+                now.as_micros(),
+                "Invalid or expired handshake cookie from {RemoteEndpoint}",
+                RemoteEndpoint = from
+            );
             return false;
         }
         if let Some(&index) = self.by_addr.get(&from) {
@@ -995,6 +1129,15 @@ impl Manager {
         let peer = Peer::new(&self.config, from, false, state, nonce, now);
         let index = self.insert_peer(peer);
         let id = self.id_of(index);
+        netlog!(
+            self.log,
+            Info,
+            now.as_micros(),
+            "Connection request {PeerId} from {RemoteEndpoint} with {DataLength} bytes of data",
+            PeerId = id.to_bits(),
+            RemoteEndpoint = from,
+            DataLength = data.len()
+        );
         let data = self.events.store(data);
         self.events.push(EventRec::ConnectRequest {
             peer: id,
@@ -1022,6 +1165,15 @@ impl Manager {
         peer.last_recv = now;
         peer.last_send = now;
         peer.last_ping = now;
+        netlog!(
+            self.log,
+            Info,
+            now.as_micros(),
+            "Connected to {RemoteEndpoint} as peer {PeerId}, connection {ConnId}",
+            RemoteEndpoint = from,
+            PeerId = peer.id,
+            ConnId = conn_id
+        );
         self.events.push(EventRec::Connected { peer: id, addr: from });
         true
     }
@@ -1077,6 +1229,14 @@ impl Manager {
         // Our address changed (NAT rebinding): prove who we are in the next packets.
         if peer.migrate_from.is_none() {
             peer.migrate_from = Some(peer.next_seq);
+            netlog!(
+                self.log,
+                Info,
+                self.now_hint.as_micros(),
+                "Server {RemoteEndpoint} does not know our address: peer {PeerId} proves its identity",
+                RemoteEndpoint = from,
+                PeerId = peer.id
+            );
         }
         true
     }
@@ -1114,6 +1274,14 @@ impl Manager {
         if p.old != p.addr {
             self.by_addr.remove(&p.old);
         }
+        netlog!(
+            self.log,
+            Info,
+            self.now_hint.as_micros(),
+            "Path to {RemoteEndpoint} of peer {PeerId} validated",
+            RemoteEndpoint = from,
+            PeerId = peer.id
+        );
         true
     }
 
@@ -1127,6 +1295,13 @@ impl Manager {
                 // One byte in reply to at least three: no amplification.
                 self.tx.push_control(self.config.mtu, from, &Control::WhoAreYou, None);
                 self.stats.who_are_you_sent += 1;
+                netlog!(
+                    self.log,
+                    Debug,
+                    now.as_micros(),
+                    "DATA from unknown {RemoteEndpoint}: asked it to identify",
+                    RemoteEndpoint = from
+                );
             }
             return None;
         };
@@ -1140,6 +1315,14 @@ impl Manager {
             && !MsgIter::new(r.rest(), &peer.modes).any(|m| m.is_err());
         if !valid {
             self.stats.invalid_migrations += 1;
+            netlog!(
+                self.log,
+                Warn,
+                now.as_micros(),
+                "Rejected move of connection {ConnId} to {RemoteEndpoint}: invalid token or replayed packet",
+                ConnId = conn_id,
+                RemoteEndpoint = from
+            );
             return None;
         }
         let mut old = peer.addr;
@@ -1163,6 +1346,15 @@ impl Manager {
             sent: 9,
         });
         peer.stats.migrations += 1;
+        netlog!(
+            self.log,
+            Info,
+            now.as_micros(),
+            "Peer {PeerId} moved from {OldEndpoint} to {NewEndpoint}",
+            PeerId = peer.id,
+            OldEndpoint = old,
+            NewEndpoint = from
+        );
         self.tx
             .push_control(self.config.mtu, from, &Control::PathChallenge { challenge }, None);
         self.by_addr.insert(from, index);
@@ -1177,6 +1369,15 @@ impl Manager {
                 Some(index) => index,
                 None => {
                     self.stats.datagrams_dropped += 1;
+                    netlog!(
+                        self.log,
+                        Debug,
+                        now.as_micros(),
+                        "Dropped {Length} byte datagram from {RemoteEndpoint}: {Reason}",
+                        Length = data.len(),
+                        RemoteEndpoint = from,
+                        Reason = "unknown sender"
+                    );
                     return;
                 }
             },
@@ -1189,13 +1390,26 @@ impl Manager {
             config,
             tx,
             by_addr,
+            log,
             ..
         } = self;
         let Some(peer) = slots[index as usize].peer.as_mut() else {
             return;
         };
+        let drop = |log: &mut Logger, reason: &str| {
+            netlog!(
+                log,
+                Debug,
+                now.as_micros(),
+                "Dropped {Length} byte datagram from {RemoteEndpoint}: {Reason}",
+                Length = data.len(),
+                RemoteEndpoint = from,
+                Reason = reason
+            );
+        };
         if !matches!(peer.state, State::Connected) {
             stats.datagrams_dropped += 1;
+            drop(log, "peer not connected");
             return;
         }
         if let Some(p) = &mut peer.path {
@@ -1206,6 +1420,7 @@ impl Manager {
         let mut r = Reader::new(data);
         let Some(header) = DataHeader::decode(&mut r) else {
             peer.stats.packets_malformed += 1;
+            drop(log, "malformed header");
             return;
         };
         if let (Some(p), Some((conn_id, token))) = (peer.path, header.migrate) {
@@ -1217,19 +1432,34 @@ impl Manager {
                 if p.old != p.addr {
                     by_addr.remove(&p.old);
                 }
+                netlog!(
+                    log,
+                    Info,
+                    now.as_micros(),
+                    "Path to {RemoteEndpoint} of peer {PeerId} validated",
+                    RemoteEndpoint = from,
+                    PeerId = peer.id
+                );
             }
         }
         let body = r.rest();
         // Validate the whole packet before acting on any of it.
         if MsgIter::new(body, &peer.modes).any(|m| m.is_err()) {
             peer.stats.packets_malformed += 1;
+            drop(log, "malformed body");
             return;
         }
         let largest = peer.recv.latest();
         match peer.recv.insert(header.seq) {
             Received::New => {}
-            Received::Duplicate | Received::TooOld => {
+            Received::Duplicate => {
                 peer.stats.packets_duplicate += 1;
+                drop(log, "duplicate");
+                return;
+            }
+            Received::TooOld => {
+                peer.stats.packets_duplicate += 1;
+                drop(log, "older than the receive window");
                 return;
             }
         }
@@ -1242,7 +1472,7 @@ impl Manager {
         peer.stats.packets_received += 1;
         peer.stats.bytes_received += data.len() as u64;
         if let Some((ack, bits, delay)) = header.ack {
-            process_acks(peer, now, ack, bits, decode_ack_delay(delay), config.max_ack_delay);
+            process_acks(peer, now, ack, bits, decode_ack_delay(delay), config.max_ack_delay, log);
         }
         let ping_ack_allowed = peer.last_ping_ack.is_none_or(|t| now - t >= config.ping_interval / 4);
         if header.flags & FLAG_PING != 0 && !ping_ack_allowed {
@@ -1264,12 +1494,14 @@ impl Manager {
             ack_pending,
             ..
         } = peer;
+        let mut messages = 0usize;
         let mut current = [false; MAX_CHANNELS];
         for (i, ch) in channels.iter().enumerate() {
             current[i] = ch.mode != DeliveryMode::UnreliableSequenced || ch.sequenced_current(header.seq);
         }
         for msg in MsgIter::new(body, modes) {
             let Ok(msg) = msg else { break };
+            messages += 1;
             let c = usize::from(msg.channel);
             let ch = &mut channels[c];
             let mut deliver = |data: &[u8]| {
@@ -1301,6 +1533,16 @@ impl Manager {
                 ch.set_sequenced_latest(header.seq);
             }
         }
+        netlog!(
+            log,
+            Trace,
+            now.as_micros(),
+            "Received datagram {Seq} of {Length} bytes with {Messages} messages from peer {PeerId}",
+            Seq = header.seq,
+            Length = data.len(),
+            Messages = messages,
+            PeerId = peer.id
+        );
     }
 
     /// Runs timers: handshake retransmissions, connection and handshake timeouts.
@@ -1313,9 +1555,11 @@ impl Manager {
             scratch,
             by_addr,
             stats,
+            log,
             ..
         } = self;
         scratch.clear();
+        let t = now.as_micros();
         for (index, slot) in slots.iter_mut().enumerate() {
             let Some(peer) = slot.peer.as_mut() else {
                 continue;
@@ -1324,8 +1568,22 @@ impl Manager {
             match &mut peer.state {
                 State::Connecting { next_retry, deadline } => {
                     if now >= *deadline {
+                        netlog!(
+                            log,
+                            Warn,
+                            t,
+                            "No answer from {RemoteEndpoint}: connection attempt timed out",
+                            RemoteEndpoint = peer.addr
+                        );
                         scratch.push((index, Some(ReasonRec::ConnectTimeout)));
                     } else if now >= *next_retry {
+                        netlog!(
+                            log,
+                            Debug,
+                            t,
+                            "Retrying connect request to {RemoteEndpoint}",
+                            RemoteEndpoint = peer.addr
+                        );
                         *next_retry = now + config.connect_retry;
                         let request = Control::ConnectRequest {
                             protocol_id: config.protocol_id,
@@ -1342,8 +1600,22 @@ impl Manager {
                     deadline,
                 } => {
                     if now >= *deadline {
+                        netlog!(
+                            log,
+                            Warn,
+                            t,
+                            "Handshake with {RemoteEndpoint} timed out after the challenge",
+                            RemoteEndpoint = peer.addr
+                        );
                         scratch.push((index, Some(ReasonRec::ConnectTimeout)));
                     } else if now >= *next_retry {
+                        netlog!(
+                            log,
+                            Debug,
+                            t,
+                            "Retrying challenge response to {RemoteEndpoint}",
+                            RemoteEndpoint = peer.addr
+                        );
                         *next_retry = now + config.connect_retry;
                         let response = Control::ChallengeResponse {
                             nonce: peer.nonce,
@@ -1356,12 +1628,34 @@ impl Manager {
                 }
                 State::Pending { deadline } => {
                     if now >= *deadline {
+                        netlog!(
+                            log,
+                            Warn,
+                            t,
+                            "Connection request {PeerId} from {RemoteEndpoint} was neither accepted nor rejected in time",
+                            PeerId = peer.id,
+                            RemoteEndpoint = peer.addr
+                        );
                         scratch.push((index, None));
                     }
                 }
                 State::Connected => {
                     if now - peer.last_recv >= config.timeout {
+                        netlog!(
+                            log,
+                            Warn,
+                            t,
+                            "Peer {PeerId} at {RemoteEndpoint} timed out after {Silence} ms without packets",
+                            PeerId = peer.id,
+                            RemoteEndpoint = peer.addr,
+                            Silence = now - peer.last_recv
+                        );
                         scratch.push((index, Some(ReasonRec::Timeout)));
+                    }
+                    if let Some(iv) = config.stats_interval {
+                        if now - peer.last_stats >= iv {
+                            log_peer_stats(log, peer, now, config.mtu);
+                        }
                     }
                     if let Some(p) = &mut peer.path {
                         if now < p.deadline && now >= p.next_challenge {
@@ -1378,6 +1672,15 @@ impl Manager {
                             peer.addr = p.old;
                             by_addr.remove(&p.addr);
                             stats.failed_path_validations += 1;
+                            netlog!(
+                                log,
+                                Warn,
+                                t,
+                                "Path to {RemoteEndpoint} of peer {PeerId} not validated: back to {OldEndpoint}",
+                                RemoteEndpoint = p.addr,
+                                PeerId = peer.id,
+                                OldEndpoint = p.old
+                            );
                         }
                     }
                 }
@@ -1396,6 +1699,14 @@ impl Manager {
         for peer in self.slots.iter_mut().filter_map(|s| s.peer.as_mut()) {
             if peer.outgoing && matches!(peer.state, State::Connected) && peer.migrate_from.is_none() {
                 peer.migrate_from = Some(peer.next_seq);
+                netlog!(
+                    self.log,
+                    Info,
+                    self.now_hint.as_micros(),
+                    "Local address changed: peer {PeerId} proves its identity to {RemoteEndpoint}",
+                    PeerId = peer.id,
+                    RemoteEndpoint = peer.addr
+                );
             }
         }
     }
@@ -1404,7 +1715,9 @@ impl Manager {
     /// pending acks, pings and keepalives.
     pub fn flush(&mut self, now: Time) {
         self.now_hint = self.now_hint.max(now);
-        let Manager { config, slots, tx, .. } = self;
+        let Manager {
+            config, slots, tx, log, ..
+        } = self;
         for slot in slots.iter_mut() {
             if let Some(peer) = slot.peer.as_mut() {
                 if !matches!(peer.state, State::Connected) {
@@ -1418,7 +1731,7 @@ impl Manager {
                     continue;
                 }
                 let before = peer.stats.bytes_sent;
-                flush_peer(peer, now, config, tx, limit);
+                flush_peer(peer, now, config, tx, limit, log);
                 if let Some(p) = &mut peer.path {
                     p.sent += (peer.stats.bytes_sent - before) as usize;
                 }
@@ -1530,6 +1843,12 @@ impl Manager {
         p.rtt.srtt().map(|_| p.rtt.latest())
     }
 
+    /// The session key of a connection. For tests that check secrets never reach logs.
+    #[doc(hidden)]
+    pub fn __session_key(&self, id: PeerId) -> Option<u64> {
+        Some(self.peer(id)?.session_key)
+    }
+
     /// Counters of a peer.
     pub fn peer_stats(&self, id: PeerId) -> Option<&PeerStats> {
         self.peer(id).map(|p| &p.stats)
@@ -1548,11 +1867,51 @@ impl Manager {
     }
 }
 
+/// Logs the periodic `PeerStats` event and starts a new reporting window.
+fn log_peer_stats(log: &mut Logger, peer: &mut Peer, now: Time, mtu: usize) {
+    let secs = (now - peer.last_stats).as_secs_f64().max(1e-6);
+    let s = &peer.stats;
+    let b = &peer.stats_base;
+    let sent = s.packets_sent - b.packets_sent;
+    let lost = s.packets_lost - b.packets_lost;
+    let bytes_out = s.bytes_sent - b.bytes_sent;
+    let queued: usize = peer
+        .channels
+        .iter()
+        .map(|c| c.reliable_queue_len() + c.unreliable_queue_len())
+        .sum();
+    netlog!(
+        log,
+        Info,
+        now.as_micros(),
+        "Peer {PeerId}: RTT {RttMs} ms ±{RttVarMs}, loss {LossPercent}%, out {BytesOutPerSec} B/s, in {BytesInPerSec} B/s, fill {FillPercent}%, retransmitted {Retransmitted}, queued {Queued}",
+        PeerId = peer.id,
+        RttMs = peer.rtt.srtt().unwrap_or_default(),
+        RttVarMs = peer.rtt.rttvar(),
+        LossPercent = (lost * 1000).checked_div(sent).unwrap_or(0) as f64 / 10.0,
+        BytesOutPerSec = (bytes_out as f64 / secs) as u64,
+        BytesInPerSec = ((s.bytes_received - b.bytes_received) as f64 / secs) as u64,
+        FillPercent = (bytes_out * 100).checked_div(sent * mtu as u64).unwrap_or(0),
+        Retransmitted = s.messages_retransmitted - b.messages_retransmitted,
+        Queued = queued
+    );
+    peer.stats_base = peer.stats.clone();
+    peer.last_stats = now;
+}
+
 /// Packet threshold for loss detection (RFC 9002): a packet is lost once a packet sent
 /// this many packets later is acknowledged.
 const PACKET_THRESHOLD: u16 = 3;
 
-fn process_acks(peer: &mut Peer, now: Time, ack: u16, bits: u16, ack_delay: Duration, max_ack_delay: Duration) {
+fn process_acks(
+    peer: &mut Peer,
+    now: Time,
+    ack: u16,
+    bits: u16,
+    ack_delay: Duration,
+    max_ack_delay: Duration,
+    log: &mut Logger,
+) {
     // An ack for a packet we have not sent yet is bogus.
     let last_sent = peer.next_seq.wrapping_sub(1);
     if peer.stats.packets_sent == 0 || seq_newer(ack, last_sent) {
@@ -1600,22 +1959,35 @@ fn process_acks(peer: &mut Peer, now: Time, ack: u16, bits: u16, ack_delay: Dura
         let seq = peer.loss_scan;
         let slot = &mut peer.sent[usize::from(seq) % SENT_RING];
         if slot.in_use && slot.seq == seq && !slot.acked {
-            declare_lost(slot, &mut peer.channels, &mut peer.stats);
+            let pieces = slot.units.len();
+            if declare_lost(slot, &mut peer.channels, &mut peer.stats) {
+                netlog!(
+                    log,
+                    Debug,
+                    now.as_micros(),
+                    "Datagram {Seq} to peer {PeerId} lost with {Pieces} reliable pieces",
+                    Seq = seq,
+                    PeerId = peer.id,
+                    Pieces = pieces
+                );
+            }
         }
         peer.loss_scan = seq.wrapping_add(1);
     }
 }
 
-fn declare_lost(slot: &mut SentPacket, channels: &mut [Channel], stats: &mut PeerStats) {
+/// Returns `true` if the packet carried reliable data (and so counts as a loss).
+fn declare_lost(slot: &mut SentPacket, channels: &mut [Channel], stats: &mut PeerStats) -> bool {
     slot.in_use = false;
     if slot.units.is_empty() {
         // Packets without reliable data are not acked unless the remote side happens to send.
-        return;
+        return false;
     }
     stats.packets_lost += 1;
     for &(ch, mseq, unit) in &slot.units {
         channels[usize::from(ch)].on_lost(mseq, unit, slot.seq);
     }
+    true
 }
 
 /// Takes the ring slot for packet `seq`. A packet still unacknowledged after the ring wrapped
@@ -1790,11 +2162,29 @@ impl Scheduler {
 
 /// Flushes one peer. `strict_limit` caps the bytes sent in this flush exactly (used for the
 /// anti-amplification limit); the bandwidth budget may be exceeded by one item.
-fn flush_peer(peer: &mut Peer, now: Time, config: &Config, tx: &mut TxQueue, strict_limit: Option<usize>) {
+fn flush_peer(
+    peer: &mut Peer,
+    now: Time,
+    config: &Config,
+    tx: &mut TxQueue,
+    strict_limit: Option<usize>,
+    log: &mut Logger,
+) {
+    let t = now.as_micros();
     if peer.outgoing && peer.migrate_from.is_none() && now - peer.last_recv >= config.migration_probe {
         // Silence from the server may mean our address changed: include proof of identity.
         peer.migrate_from = Some(peer.next_seq);
+        netlog!(
+            log,
+            Info,
+            t,
+            "No packets from {RemoteEndpoint} for {Silence} ms: peer {PeerId} proves its identity in case our address changed",
+            RemoteEndpoint = peer.addr,
+            Silence = now - peer.last_recv,
+            PeerId = peer.id
+        );
     }
+    let peer_id = peer.id;
     let migrating = peer.outgoing && peer.migrate_from.is_some();
     let (conn_id, session_key) = (peer.conn_id, peer.session_key);
     let ping_due = now - peer.last_ping >= config.ping_interval;
@@ -1830,6 +2220,16 @@ fn flush_peer(peer: &mut Peer, now: Time, config: &Config, tx: &mut TxQueue, str
         );
     }
     stats.messages_expired += cstats.expired;
+    if cstats.expired > 0 {
+        netlog!(
+            log,
+            Debug,
+            t,
+            "Dropped {Count} unreliable messages to peer {PeerId}: TTL expired before they could be sent",
+            Count = cstats.expired,
+            PeerId = peer_id
+        );
+    }
     let ack = if peer.received_any && (peer.ack_pending || peer.ack_repeat > 0) {
         recv.ack()
             .map(|(ack, bits)| (ack, bits, encode_ack_delay(now - peer.largest_recv_time)))
@@ -1885,6 +2285,19 @@ fn flush_peer(peer: &mut Peer, now: Time, config: &Config, tx: &mut TxQueue, str
             packet: 0,
             key: (c.channel, seq_offset, c.start, idx),
         });
+    }
+
+    let held = cands.len() - sched.sel.len();
+    if held > 0 {
+        netlog!(
+            log,
+            Debug,
+            t,
+            "Budget held back {Held} of {Candidates} pieces for peer {PeerId}",
+            Held = held,
+            Candidates = cands.len(),
+            PeerId = peer_id
+        );
     }
 
     // ---- phase 2: best fit decreasing into packets; fragments fill the gaps ----
@@ -2043,6 +2456,16 @@ fn flush_peer(peer: &mut Peer, now: Time, config: &Config, tx: &mut TxQueue, str
         peer.next_seq = seq.wrapping_add(1);
         peer.tokens -= len as i64;
         let items = (i - first_item) as u64;
+        netlog!(
+            log,
+            Trace,
+            t,
+            "Sent datagram {Seq} of {Length} bytes with {Pieces} pieces to peer {PeerId}",
+            Seq = seq,
+            Length = len,
+            Pieces = items,
+            PeerId = peer_id
+        );
         stats.packets_sent += 1;
         stats.bytes_sent += len as u64;
         stats.messages_sent += items;
@@ -2058,6 +2481,18 @@ fn flush_peer(peer: &mut Peer, now: Time, config: &Config, tx: &mut TxQueue, str
         let seq = sched.seqs[s.packet as usize];
         if channels[usize::from(c.channel)].mark_sent(c.kind, s.start, s.end, now, seq) {
             stats.messages_retransmitted += 1;
+            netlog!(
+                log,
+                Debug,
+                t,
+                "Retransmitted bytes {Start}..{End} of message {MessageSeq} on channel {Channel} to peer {PeerId} in datagram {Seq}",
+                Start = s.start,
+                End = s.end,
+                MessageSeq = channels[usize::from(c.channel)].piece(c.kind, s.start, s.end).seq,
+                Channel = c.channel,
+                PeerId = peer_id,
+                Seq = seq
+            );
         }
     }
     if ping_due {

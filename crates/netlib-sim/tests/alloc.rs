@@ -113,8 +113,29 @@ fn traffic(m: &mut Manager, peer: PeerId, tick: u32) -> u64 {
     received
 }
 
+/// Counts events without formatting them.
+struct CountingSink(std::sync::Arc<AtomicU64>);
+
+impl netlib_core::log::LogSink for CountingSink {
+    fn enabled(&self, _: netlib_core::log::Level) -> bool {
+        true
+    }
+    fn log(&mut self, r: &netlib_core::log::Record<'_>) {
+        self.0.fetch_add(r.properties.len() as u64 + 1, Ordering::Relaxed);
+    }
+}
+
 #[test]
 fn p1_pk5_steady_state_does_not_allocate() {
+    steady_state(false);
+}
+
+#[test]
+fn l3_logging_every_event_does_not_allocate() {
+    steady_state(true);
+}
+
+fn steady_state(with_logging: bool) {
     // The counter works.
     let (v, n) = counted(|| Vec::<u8>::with_capacity(16));
     assert_eq!(n, 1);
@@ -127,6 +148,11 @@ fn p1_pk5_steady_state_does_not_allocate() {
     let mut wire = Wire {
         bufs: Vec::with_capacity(256),
     };
+    let logged = std::sync::Arc::new(AtomicU64::new(0));
+    if with_logging {
+        server.set_log_sink(Some(Box::new(CountingSink(logged.clone()))));
+        client.set_log_sink(Some(Box::new(CountingSink(logged.clone()))));
+    }
     let cpeer = client.connect(now, saddr, &[]).unwrap();
     let mut speer = None;
     let mut step = |server: &mut Manager, client: &mut Manager, now: Time, tick: u32, speer: &mut Option<PeerId>| {
@@ -169,4 +195,8 @@ fn p1_pk5_steady_state_does_not_allocate() {
     });
     assert!(received > 3000 * 2 * 500, "traffic flowed: {received} bytes");
     assert_eq!(allocations, 0, "allocations in 3000 steady-state ticks");
+    if with_logging {
+        // Trace events for every datagram were produced and consumed.
+        assert!(logged.load(Ordering::Relaxed) > 3000 * 2 * 4);
+    }
 }

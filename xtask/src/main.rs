@@ -3,12 +3,16 @@
 //! - `report [--milestone M1] [--all]` runs the checks and tests and prints the acceptance
 //!   criteria table. Tests are linked to criteria by name: `r5_timeout_after_partition`
 //!   covers criterion R5.
+//! - `log-catalog` regenerates `docs/LOG_EVENTS.md` from the `netlog!` calls.
+//! - `logview FILE [--peer ID] [--event ID] [--min-level L] [--summary]` reads CLEF logs.
 //! - `header [--check]` generates `bindings/c/netlib.h` from `crates/netlib-ffi` with
 //!   cbindgen; `--check` fails if the committed header is out of date.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::process::{Command, ExitCode};
+
+mod logs;
 
 /// `(id, milestone, description)` for every criterion of docs/PLAN.md.
 const CRITERIA: &[(&str, &str, &str)] = &[
@@ -58,8 +62,40 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("report") => report(&args[1..]),
         Some("header") => header(args.iter().any(|a| a == "--check")),
+        Some("log-catalog") => {
+            let entries = logs::catalog(std::path::Path::new("."));
+            let problems = logs::lint(&entries);
+            if !problems.is_empty() {
+                for p in problems {
+                    eprintln!("{p}");
+                }
+                return ExitCode::FAILURE;
+            }
+            match std::fs::write("docs/LOG_EVENTS.md", logs::catalog_markdown(&entries)) {
+                Ok(()) => {
+                    eprintln!("wrote docs/LOG_EVENTS.md with {} events", entries.len());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some("logview") => match logs::logview(&args[1..]) {
+            Ok(out) => {
+                print!("{out}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        },
         _ => {
-            eprintln!("usage: cargo xtask report [--milestone M1] [--all] | header [--check]");
+            eprintln!(
+                "usage: cargo xtask report [--milestone M1] [--all] | header [--check] | log-catalog | logview FILE"
+            );
             ExitCode::FAILURE
         }
     }

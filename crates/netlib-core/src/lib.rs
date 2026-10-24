@@ -26,3 +26,6 @@ pub use config::{ChannelConfig, Config, ConfigError, DeliveryMode, MAX_CHANNELS,
 pub use event::{DisconnectReason, Event, PeerId};
 pub use manager::{ConnectError, Manager, ManagerStats, PeerError, PeerState, PeerStats, SendError};
 pub use time::Time;
+
+/// Structured logging; see [`Manager::set_log_sink`].
+pub use netlib_log as log;

@@ -18,6 +18,9 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+pub mod logging;
+
+pub use netlib_core::log;
 pub use netlib_core::{
     ChannelConfig, Config, ConfigError, ConnectError, DeliveryMode, DisconnectReason, Event, ManagerStats, PeerError,
     PeerId, PeerState, PeerStats, SendError, SendOptions, Time,
@@ -363,6 +366,16 @@ impl Manager {
     /// Smoothed network RTT of a peer.
     pub fn peer_rtt(&self, peer: PeerId) -> Option<Duration> {
         self.with_core(|c| c.peer_rtt(peer))
+    }
+
+    /// Sets the log sink, or removes it with `None`. See [`logging`] for ready-made sinks.
+    pub fn set_log_sink(&mut self, sink: Option<Box<dyn log::LogSink + Send>>) {
+        self.inner.lock().core.set_log_sink(sink);
+    }
+
+    /// The manager's clock as microseconds, for mapping log times to wall-clock time.
+    pub fn epoch(&self) -> Instant {
+        self.inner.epoch
     }
 
     /// Remote address of a peer.

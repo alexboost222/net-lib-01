@@ -9,7 +9,87 @@ use std::collections::BinaryHeap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
+use std::sync::{Arc, Mutex};
+
+use netlib_core::log::{EventId, Level, LogSink, Record, Value};
 use netlib_core::{Config, ConfigError, Manager, Time};
+
+/// An owned copy of a log event.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogEntry {
+    /// Event time, microseconds on the manager clock.
+    pub time_us: u64,
+    /// Level.
+    pub level: Level,
+    /// Event id.
+    pub id: EventId,
+    /// Template text.
+    pub template: &'static str,
+    /// Rendered message.
+    pub message: String,
+    /// Properties with values rendered as text.
+    pub properties: Vec<(&'static str, String)>,
+}
+
+impl LogEntry {
+    /// The rendered value of a property.
+    pub fn prop(&self, name: &str) -> Option<&str> {
+        self.properties
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// A sink that keeps every event in memory; clones share the same storage.
+#[derive(Debug, Clone)]
+pub struct LogCapture {
+    entries: Arc<Mutex<Vec<LogEntry>>>,
+    min: Level,
+}
+
+impl LogCapture {
+    /// Captures events of `min` level and above.
+    pub fn new(min: Level) -> Self {
+        LogCapture {
+            entries: Arc::default(),
+            min,
+        }
+    }
+
+    /// A copy of everything captured so far.
+    pub fn entries(&self) -> Vec<LogEntry> {
+        self.entries.lock().expect("log capture").clone()
+    }
+}
+
+impl LogSink for LogCapture {
+    fn enabled(&self, level: Level) -> bool {
+        level >= self.min
+    }
+
+    fn log(&mut self, record: &Record<'_>) {
+        let properties = record
+            .properties
+            .iter()
+            .map(|p| {
+                let v = match p.value {
+                    Value::Str(s) => s.to_string(),
+                    v => v.to_string(),
+                };
+                (p.name, v)
+            })
+            .collect();
+        self.entries.lock().expect("log capture").push(LogEntry {
+            time_us: record.time_us,
+            level: record.template.level,
+            id: record.template.id,
+            template: record.template.text,
+            message: record.render().to_string(),
+            properties,
+        });
+    }
+}
 
 /// Conditions applied to every datagram.
 #[derive(Debug, Clone, PartialEq)]
