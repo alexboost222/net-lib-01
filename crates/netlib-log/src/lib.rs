@@ -352,6 +352,56 @@ mod tests {
     }
 
     #[test]
+    fn values_and_levels() {
+        let mut c = Capture {
+            min: Some(Level::Trace),
+            ..Capture::default()
+        };
+        let s = alloc::string::String::from("owned");
+        netlog!(
+            c,
+            Error,
+            0,
+            "{A} {B} {C} {D} {E} {F} {G} {H} {I} {J}",
+            A = 1u8,
+            B = -1i32,
+            C = 2usize,
+            D = 1.5f32,
+            E = false,
+            F = s.as_str(),
+            G = *"slice",
+            H = Value::U64(9),
+            I = Duration::from_secs(1),
+            J = 7u16
+        );
+        assert_eq!(c.lines[0].2, "1 -1 2 1.5 false owned slice 9 1000 7");
+        let names: alloc::vec::Vec<_> = [Level::Trace, Level::Debug, Level::Info, Level::Warn, Level::Error]
+            .iter()
+            .map(|l| l.clef_name())
+            .collect();
+        assert_eq!(names, ["Verbose", "Debug", "Information", "Warning", "Error"]);
+        let mut n = NoSink;
+        netlog!(n, Error, 0, "never");
+        let mut boxed: alloc::boxed::Box<dyn LogSink> = alloc::boxed::Box::new(Capture {
+            min: Some(Level::Info),
+            ..Capture::default()
+        });
+        assert!(boxed.enabled(Level::Info) && !boxed.enabled(Level::Debug));
+        netlog!(boxed, Info, 0, "boxed {X}", X = 1u64);
+        let r = Record {
+            template: &Template {
+                text: "{X}",
+                level: Level::Info,
+                id: 0,
+            },
+            time_us: 0,
+            properties: &[],
+        };
+        assert_eq!(r.get("X"), None);
+        assert_eq!(r.render().to_string(), "{X}");
+    }
+
+    #[test]
     fn l2_event_ids_are_stable() {
         // FNV-1a 32 of the template text: changing these values breaks log queries.
         assert_eq!(event_id(""), 0x811c_9dc5);

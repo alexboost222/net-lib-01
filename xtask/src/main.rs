@@ -3,6 +3,10 @@
 //! - `report [--milestone M1] [--all]` runs the checks and tests and prints the acceptance
 //!   criteria table. Tests are linked to criteria by name: `r5_timeout_after_partition`
 //!   covers criterion R5.
+//! - `coverage [--html] [--update-baseline]` measures coverage and the mutation score and
+//!   checks thresholds and the baseline (criteria T1-T7).
+//! - `unity-package [--natives DIR]` assembles the Unity package and a tarball in
+//!   `target/unity`; natives are `DIR/<platform>/<file>`, or the host library is built.
 //! - `log-catalog` regenerates `docs/LOG_EVENTS.md` from the `netlog!` calls.
 //! - `logview FILE [--peer ID] [--event ID] [--min-level L] [--summary]` reads CLEF logs.
 //! - `header [--check]` generates `bindings/c/netlib.h` from `crates/netlib-ffi` with
@@ -12,7 +16,9 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::process::{Command, ExitCode};
 
+mod coverage;
 mod logs;
+mod unity;
 
 /// `(id, milestone, description)` for every criterion of docs/PLAN.md.
 const CRITERIA: &[(&str, &str, &str)] = &[
@@ -65,6 +71,18 @@ const CRITERIA: &[(&str, &str, &str)] = &[
     ("L6", "M6", "Failure scenarios are explained by the logs"),
     ("L7", "M6", "logview: filters, timeline, summary"),
     ("L8", "M6", "No secrets in logs"),
+    ("T1", "M7", "netlib-core line coverage >= 90%"),
+    ("T2", "M7", "netlib-core branch coverage >= 80%"),
+    ("T3", "M7", "Other Rust crates line coverage >= 75%"),
+    ("T4", "M7", "netlib-core mutation score >= 85%"),
+    ("T5", "M7", ".NET binding line coverage >= 80%"),
+    ("T6", "M7", "Every criterion is traced to tests"),
+    ("T7", "M7", "Coverage does not drop by more than 0.5 points"),
+    ("Q3", "M7", "Coverage gates (see T1-T5)"),
+    ("X1", "M8", "Native builds for all target platforms in CI"),
+    ("X4", "M8", "IL2CPP-friendly API; package sources compile like Unity 6"),
+    ("X6", "M8", "Unity package complete and importable (automatic part)"),
+    ("P4", "M8", "Dynamic libraries < 1 MiB"),
 ];
 
 const MILESTONES: &[&str] = &["M0", "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9", "M10"];
@@ -94,6 +112,26 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("unity-package") => match unity::run(&args[1..]) {
+            Ok(out) => {
+                print!("{out}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        },
+        Some("coverage") => match coverage::run(&args[1..]) {
+            Ok(out) => {
+                print!("{out}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::FAILURE
+            }
+        },
         Some("logview") => match logs::logview(&args[1..]) {
             Ok(out) => {
                 print!("{out}");
@@ -158,6 +196,69 @@ fn header(check: bool) -> ExitCode {
         Err(e) => {
             eprintln!("cannot write {HEADER}: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// Evidence for coverage criteria from the last `cargo xtask coverage` run.
+fn coverage_evidence(id: &str) -> (String, bool) {
+    let Some(v) = std::fs::read_to_string(coverage::SUMMARY)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+    else {
+        return ("run `cargo xtask coverage`".into(), false);
+    };
+    let get = |k: &str| v[k].as_f64();
+    let at_least = |k: &str, min: f64| match get(k) {
+        Some(x) => (format!("{x:.1}% (≥ {min}%)"), x >= min),
+        None => ("not measured".into(), false),
+    };
+    match id {
+        "T1" => at_least("core_lines", coverage::CORE_LINES),
+        "T2" => at_least("core_branches", coverage::CORE_BRANCHES),
+        "T3" => {
+            let crates = ["netlib", "netlib-ffi", "netlib-log", "netlib-sim"];
+            let vals: Vec<(String, f64)> = crates
+                .iter()
+                .filter_map(|c| get(&format!("{c}_lines")).map(|x| (c.to_string(), x)))
+                .collect();
+            let pass = vals.len() == crates.len() && vals.iter().all(|(_, x)| *x >= coverage::OTHER_LINES);
+            let text = vals
+                .iter()
+                .map(|(c, x)| format!("{c} {x:.1}%"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            (text, pass)
+        }
+        "T4" => at_least("core_mutation_score", coverage::MUTATION_SCORE),
+        "T5" => at_least("dotnet_lines", coverage::DOTNET_LINES),
+        "T7" => {
+            let base = std::fs::read_to_string("coverage-baseline.json")
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+            match base {
+                Some(b) => {
+                    let drops: Vec<String> = b
+                        .as_object()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|(k, bv)| {
+                            let d = get(k)? - bv.as_f64()?;
+                            (d < -coverage::MAX_DROP).then(|| format!("{k} {d:+.1}"))
+                        })
+                        .collect();
+                    if drops.is_empty() {
+                        ("no drop against coverage-baseline.json".into(), true)
+                    } else {
+                        (drops.join(", "), false)
+                    }
+                }
+                None => ("no coverage-baseline.json".into(), false),
+            }
+        }
+        _ => {
+            let all = ["T1", "T2", "T3", "T4", "T5"].iter().all(|t| coverage_evidence(t).1);
+            ("T1-T5".into(), all)
         }
     }
 }
@@ -315,6 +416,55 @@ fn report(args: &[String]) -> ExitCode {
                 )
             }
             "Q2" => ("docs/WIRE_FORMAT.md".into(), q2_ok),
+            "T1" | "T2" | "T3" | "T4" | "T5" | "T7" | "Q3" => coverage_evidence(id),
+            "X1" => (
+                "workflow Unity package, job native (CI only)".into(),
+                std::fs::read_to_string(".github/workflows/unity.yml").is_ok_and(|w| {
+                    ["aarch64-apple-ios", "cargo ndk", "lipo -create", "windows-latest"]
+                        .iter()
+                        .all(|k| w.contains(k))
+                }),
+            ),
+            "P4" => {
+                let lib = [
+                    "target/release/libnetlib_ffi.so",
+                    "target/release/libnetlib_ffi.dylib",
+                    "target/release/netlib_ffi.dll",
+                ]
+                .iter()
+                .find_map(|p| std::fs::metadata(p).ok().map(|m| (*p, m.len())));
+                match lib {
+                    Some((p, n)) => (format!("{p}: {n} bytes (all platforms checked in CI)"), n < 1 << 20),
+                    None => ("build with cargo build --release -p netlib-ffi".into(), false),
+                }
+            }
+            "X4" => {
+                let ok = |args: &[&str]| run("dotnet", args).0;
+                let built = run(&cargo, &["xtask", "unity-package"]).0
+                    && ok(&["build", "unity/ci", "--nologo"])
+                    && ok(&["build", "unity/ci", "--nologo", "-p:DefineConstants=UNITY_IOS"]);
+                (
+                    "unity/ci compiles (C# 9, netstandard2.1, iOS branch); IL2CPP on device: docs/UNITY.md".into(),
+                    built,
+                )
+            }
+            "T6" => {
+                // Criteria up to the selected milestone (M7 at most) without any test.
+                let untraced: Vec<&str> = CRITERIA
+                    .iter()
+                    .filter(|(cid, m, _)| {
+                        let rank = MILESTONES.iter().position(|x| x == m).unwrap_or(usize::MAX);
+                        rank <= upto.min(7) && !cid.starts_with('T') && !["Q1", "Q2", "Q3"].contains(cid)
+                    })
+                    .filter(|(cid, _, _)| results.get(*cid).is_none_or(|r| r.passed.is_empty()))
+                    .map(|(cid, _, _)| *cid)
+                    .collect();
+                if untraced.is_empty() {
+                    ("all criteria have passing tests".into(), true)
+                } else {
+                    (format!("untraced: {}", untraced.join(", ")), false)
+                }
+            }
             "X2" => {
                 let (ok, _) = run(&cargo, &["xtask", "header", "--check"]);
                 let tests = results.get("X2").map_or((0, 0), |r| (r.passed.len(), r.failed.len()));

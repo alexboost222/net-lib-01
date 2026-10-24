@@ -224,3 +224,64 @@ public class LogTests
         Assert.False(server.TryGetLog(out _));
     }
 }
+
+public class TypeTests
+{
+    [Fact]
+    public void T5_ValueTypes()
+    {
+        var a = new PeerId(5);
+        Assert.True(a == new PeerId(5));
+        Assert.True(a != new PeerId(6));
+        Assert.True(a.Equals((object)new PeerId(5)));
+        Assert.False(a.Equals("x"));
+        Assert.Equal(5UL.GetHashCode(), a.GetHashCode());
+        Assert.Equal("Peer(5)", a.ToString());
+        Assert.Equal(-1, SendOptions.Default.Priority);
+        Assert.True(SendOptions.Replace(3).HasReplaceKey);
+        Assert.Null(default(NetAddress).ToIPEndPoint());
+    }
+
+    [Fact]
+    public void T5_AddressesRebindAndPriorities()
+    {
+        using var server = new NetManager(new NetConfig { ProtocolId = 8, AcceptIncoming = true }, "127.0.0.1:0");
+        using var client = new NetManager(new NetConfig { ProtocolId = 8 }, "127.0.0.1:0");
+        var ep = server.LocalAddress.ToIPEndPoint();
+        Assert.NotNull(ep);
+        Assert.Equal("127.0.0.1", ep!.Address.ToString());
+        var peer = client.Connect(ep.ToString());
+        System.Net.IPEndPoint? remote = null;
+        var got = 0;
+        for (var i = 0; i < 300 && got == 0; i++)
+        {
+            server.Poll();
+            while (server.TryGetEvent(out var e))
+            {
+                if (e.Kind == NetEventKind.ConnectRequest)
+                {
+                    remote = e.Address.ToIPEndPoint();
+                    server.Accept(e.Peer);
+                }
+                if (e.Kind == NetEventKind.Message) got++;
+            }
+            server.Flush();
+            client.Poll();
+            while (client.TryGetEvent(out var e))
+            {
+                if (e.Kind == NetEventKind.Connected)
+                {
+                    client.Rebind();
+                    var o = new SendOptions { Priority = 250, TtlMs = 500 };
+                    Assert.Equal(NetError.Ok, client.Send(peer, 0, new byte[] { 1 }, o));
+                }
+            }
+            client.Flush();
+            Thread.Sleep(2);
+        }
+        Assert.Equal(1, got);
+        Assert.NotNull(remote);
+        var ex = Assert.Throws<NetException>(() => client.Reject(new PeerId(999)));
+        Assert.Equal(NetError.UnknownPeer, ex.Error);
+    }
+}

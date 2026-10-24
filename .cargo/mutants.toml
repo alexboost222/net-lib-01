@@ -1,0 +1,8 @@
+# cargo mutants -p netlib-core: mutation testing of the sans-IO core (criterion T4).
+# The core is exercised mostly by the emulator tests in netlib-sim.
+test_package = ["netlib-core", "netlib-sim"]
+# Formatting and Debug output are not behaviour.
+exclude_re = ["impl .*Display", "impl .*Debug", "impl_error"]
+# Wall-clock timing tests measure the machine, not the code.
+additional_cargo_test_args = ["--", "--skip", "l4_", "--skip", "pr5_"]
+timeout_multiplier = 3.0

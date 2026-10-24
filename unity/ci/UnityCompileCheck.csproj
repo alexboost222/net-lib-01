@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Compiles the Unity package sources (Runtime from the binding with the iOS switch, and the
+    sample) the way Unity 6 does: .NET Standard 2.1, C# 9, unsafe code, warnings as errors.
+    Build twice: plain, and with UNITY_IOS to check the static-linking branch.
+  -->
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <LangVersion>9.0</LangVersion>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <Nullable>disable</Nullable>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <PackageDir Condition="'$(PackageDir)' == ''">../../target/unity/com.netlib.transport/</PackageDir>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="$(PackageDir)Runtime/*.cs" />
+    <Compile Include="$(PackageDir)Samples~/EchoDemo/*.cs" />
+    <Compile Include="UnityStubs.cs" />
+  </ItemGroup>
+</Project>

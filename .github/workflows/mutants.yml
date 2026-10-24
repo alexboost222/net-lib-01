@@ -1,0 +1,48 @@
+name: Mutation testing
+
+# T4: mutation score of netlib-core, nightly and on demand (it takes about an hour in total).
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  shard:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-mutants
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo mutants -p netlib-core --shard ${{ matrix.shard }}/8 --no-shuffle -j 2 || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mutants-${{ matrix.shard }}
+          path: mutants.out/outcomes.json
+
+  score:
+    needs: shard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mutants-*
+      - name: Mutation score >= 85%
+        run: |
+          python3 - <<'PY'
+          import glob, json, sys
+          c = m = t = 0
+          for f in glob.glob("mutants-*/outcomes.json"):
+              d = json.load(open(f))
+              c += d.get("caught", 0); m += d.get("missed", 0); t += d.get("timeout", 0)
+          score = 100 * c / max(1, c + m + t)
+          print(f"caught {c}, missed {m}, timeout {t}: {score:.1f}%")
+          sys.exit(0 if score >= 85 else 1)
+          PY

@@ -15,6 +15,10 @@ UDP-транспорт на Rust для fast-paced мультиплеера (FPS
 
 **M2**: все пять режимов доставки (`Unreliable`, `UnreliableSequenced`, `ReliableUnordered`, `ReliableOrdered`, `ReliableSequenced`).
 Повторная отправка по порогу пакетов и по RTO с backoff, фрагментация до 64 КиБ, сетевой RTT без задержки подтверждения (`ack_delay`, защита как в QUIC).
+**M8**: Unity-пакет — нативные сборки под все платформы в CI, `.meta` с настройками импорта, iOS через `__Internal`, сэмпл.
+
+**M7**: покрытие тестами — `cargo xtask coverage` (строки, ветвления, .NET, базовая линия), ночной mutation testing.
+
 **M6**: структурированное логирование — макрос `netlog!` с проверкой шаблонов при компиляции, CLEF, ограничение частоты, проброс в C#, `logview`.
 
 **M5**: C ABI (`crates/netlib-ffi`, заголовок `bindings/c/netlib.h`) и .NET-биндинг (`bindings/dotnet`, .NET Standard 2.1, ноль GC-аллокаций).
@@ -33,7 +37,8 @@ UDP-транспорт на Rust для fast-paced мультиплеера (FPS
 | `crates/netlib-ffi` | C ABI: cdylib + staticlib, poll-модель, blittable-структуры |
 | `bindings/c` | сгенерированный `netlib.h` и C smoke-тест |
 | `bindings/dotnet` | .NET Standard 2.1 биндинг, xunit-тесты, C#-клиент для echo-сервера |
-| `xtask` | `cargo xtask report` — таблица критериев; `cargo xtask header` — C-заголовок |
+| `unity/com.netlib.transport` | шаблон Unity-пакета (asmdef, сэмпл, README); собирается `cargo xtask unity-package` |
+| `xtask` | `report` — критерии; `coverage` — покрытие; `unity-package`; `header`; `log-catalog`; `logview` |
 
 ## Быстрый старт
 
@@ -70,6 +75,16 @@ loop {
     server.flush();                       // конец тика: упаковка и отправка
 }
 ```
+
+## Unity
+
+Пакет UPM `com.netlib.transport` для Unity 6: Windows, macOS, Linux (включая Dedicated Server), Android, iOS. Mono и IL2CPP.
+
+1. Скачайте `com.netlib.transport-*.tgz` — артефакт `unity-package` workflow «Unity package». Для текущей ОС можно собрать локально: `cargo xtask unity-package`.
+2. **Package Manager → + → Add package from tarball.**
+3. Сэмпл **Echo Demo** — в Package Manager.
+
+Подробности: [unity/com.netlib.transport/README.md](unity/com.netlib.transport/README.md); что проверено автоматически и что нужно проверить руками — [docs/UNITY.md](docs/UNITY.md).
 
 ## Логирование
 

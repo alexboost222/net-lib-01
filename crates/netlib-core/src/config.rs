@@ -237,3 +237,79 @@ impl Config {
         self.mtu - crate::wire::DATA_HEADER_MAX - 1 - 2 - 3 - 1
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::string::ToString;
+
+    fn check(f: impl FnOnce(&mut Config)) -> Result<(), ConfigError> {
+        let mut c = Config::default();
+        f(&mut c);
+        c.validate()
+    }
+
+    #[test]
+    fn every_invalid_setting_is_reported() {
+        assert_eq!(check(|_| {}), Ok(()));
+        assert_eq!(check(|c| c.mtu = MIN_MTU - 1), Err(ConfigError::Mtu));
+        assert_eq!(check(|c| c.mtu = MAX_MTU + 1), Err(ConfigError::Mtu));
+        assert_eq!(check(|c| c.channels.clear()), Err(ConfigError::ChannelCount));
+        assert_eq!(
+            check(|c| c.channels = vec![ChannelConfig::new(DeliveryMode::Unreliable); 17]),
+            Err(ConfigError::ChannelCount)
+        );
+        let timing: [fn(&mut Config); 7] = [
+            |c| c.connect_retry = Duration::ZERO,
+            |c| c.connect_timeout = Duration::ZERO,
+            |c| c.ping_interval = Duration::ZERO,
+            |c| c.timeout = c.ping_interval,
+            |c| c.cookie_lifetime = Duration::from_millis(500),
+            |c| c.min_rto = c.max_rto + Duration::from_millis(1),
+            |c| c.max_ack_delay = Duration::from_secs(1),
+        ];
+        for (i, f) in timing.into_iter().enumerate() {
+            assert_eq!(check(f), Err(ConfigError::Timing), "case {i}");
+        }
+        assert_eq!(check(|c| c.migration_probe = c.ping_interval), Err(ConfigError::Timing));
+        assert_eq!(check(|c| c.max_connect_data = 1000), Err(ConfigError::ConnectData));
+        let limits: [fn(&mut Config); 4] = [
+            |c| c.max_reliable_message = (1 << 24) + 1,
+            |c| c.max_reliable_queue = 0,
+            |c| c.starvation_time = Duration::ZERO,
+            |c| c.bandwidth = Some(0),
+        ];
+        for (i, f) in limits.into_iter().enumerate() {
+            assert_eq!(check(f), Err(ConfigError::ReliableLimits), "case {i}");
+        }
+        for e in [
+            ConfigError::Mtu,
+            ConfigError::ChannelCount,
+            ConfigError::Timing,
+            ConfigError::ConnectData,
+            ConfigError::ReliableLimits,
+        ] {
+            assert!(!e.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn channel_defaults_and_limits() {
+        let u = ChannelConfig::new(DeliveryMode::UnreliableSequenced);
+        assert_eq!((u.priority, u.ttl), (128, Some(Duration::from_secs(1))));
+        let r = ChannelConfig::new(DeliveryMode::ReliableOrdered)
+            .with_priority(7)
+            .with_ttl(None);
+        assert_eq!((r.priority, r.ttl), (7, None));
+        let c = Config::default();
+        assert_eq!(c.max_message_size(DeliveryMode::Unreliable), c.mtu - 9);
+        assert_eq!(
+            c.max_message_size(DeliveryMode::ReliableSequenced),
+            c.max_reliable_message
+        );
+        assert!(c.single_reliable_limit() < c.mtu);
+        for m in [DeliveryMode::Unreliable, DeliveryMode::UnreliableSequenced] {
+            assert!(!m.is_reliable());
+        }
+    }
+}

@@ -1,0 +1,134 @@
+name: Unity package
+
+# Native libraries for every Unity platform, the Unity package with import settings, and a
+# compile check of the package sources with Unity's language version and profile.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+          - name: windows-x86_64
+            os: windows-latest
+          - name: apple
+            os: macos-latest
+          - name: android
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      - name: Desktop / server
+        if: matrix.name == 'linux-x86_64' || matrix.name == 'windows-x86_64'
+        shell: bash
+        run: |
+          cargo build --release -p netlib-ffi
+          case "${{ matrix.name }}" in
+            linux-x86_64)   mkdir -p natives/Linux/x86_64  && cp target/release/libnetlib_ffi.so natives/Linux/x86_64/ ;;
+            windows-x86_64) mkdir -p natives/Windows/x86_64 && cp target/release/netlib_ffi.dll natives/Windows/x86_64/ ;;
+          esac
+
+      - name: macOS universal and iOS
+        if: matrix.name == 'apple'
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin aarch64-apple-ios
+          cargo build --release -p netlib-ffi --target aarch64-apple-darwin
+          cargo build --release -p netlib-ffi --target x86_64-apple-darwin
+          cargo build --release -p netlib-ffi --target aarch64-apple-ios
+          mkdir -p natives/macOS natives/iOS
+          lipo -create -output natives/macOS/libnetlib_ffi.dylib \
+            target/aarch64-apple-darwin/release/libnetlib_ffi.dylib \
+            target/x86_64-apple-darwin/release/libnetlib_ffi.dylib
+          install_name_tool -id @rpath/libnetlib_ffi.dylib natives/macOS/libnetlib_ffi.dylib
+          cp target/aarch64-apple-ios/release/libnetlib_ffi.a natives/iOS/
+          lipo -info natives/macOS/libnetlib_ffi.dylib
+
+      - name: Android
+        if: matrix.name == 'android'
+        run: |
+          rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+          cargo install cargo-ndk --locked
+          export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 -o ndk-out build --release -p netlib-ffi
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            mkdir -p natives/Android/$abi
+            cp ndk-out/$abi/libnetlib_ffi.so natives/Android/$abi/
+          done
+
+      - name: Size of dynamic libraries (P4 < 1 MiB)
+        shell: bash
+        run: |
+          status=0
+          while IFS= read -r f; do
+            size=$(wc -c < "$f")
+            echo "$f: $size bytes"
+            if [ "$size" -ge 1048576 ]; then echo "::error::$f is $size bytes (P4: < 1 MiB)"; status=1; fi
+          done < <(find natives -name '*.so' -o -name '*.dll' -o -name '*.dylib')
+          exit $status
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: natives-${{ matrix.name }}
+          path: natives
+
+  # Linux arm64 dedicated servers (not a Unity plugin platform). Arm runners may be unavailable
+  # for private repositories, so the package does not wait for this job.
+  native-linux-aarch64:
+    runs-on: ubuntu-24.04-arm
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release -p netlib-ffi
+      - run: mkdir -p natives/Linux/aarch64 && cp target/release/libnetlib_ffi.so natives/Linux/aarch64/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-linux-aarch64
+          path: natives
+
+  package:
+    needs: native
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: natives-*
+          path: natives
+          merge-multiple: true
+      - run: find natives -type f
+      - run: cargo xtask unity-package --natives natives
+      - name: Every Unity platform has its plugin
+        run: |
+          for f in Windows/x86_64/netlib_ffi.dll macOS/libnetlib_ffi.dylib Linux/x86_64/libnetlib_ffi.so \
+                   Android/arm64-v8a/libnetlib_ffi.so Android/armeabi-v7a/libnetlib_ffi.so \
+                   Android/x86_64/libnetlib_ffi.so iOS/libnetlib_ffi.a; do
+            test -f "target/unity/com.netlib.transport/Plugins/$f" || { echo "::error::missing $f"; exit 1; }
+          done
+      - name: Compile the package sources like Unity 6 (C# 9, .NET Standard 2.1)
+        run: |
+          dotnet build unity/ci --nologo
+          dotnet build unity/ci --nologo -p:DefineConstants=UNITY_IOS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unity-package
+          path: target/unity/com.netlib.transport-*.tgz

@@ -1,0 +1,6 @@
+{
+    "name": "NetLib.Samples.EchoDemo",
+    "references": ["NetLib"],
+    "allowUnsafeCode": false,
+    "autoReferenced": false
+}

@@ -112,7 +112,44 @@ mod tests {
     use super::*;
     use crate::{Property, Template, event_id};
     use alloc::format;
-    use alloc::string::String;
+    use alloc::string::{String, ToString};
+
+    #[test]
+    fn every_value_type_is_valid_json() {
+        static T: Template = Template {
+            text: "{A} {B} {C} {D} {E} {F} {G} {H}",
+            level: Level::Trace,
+            id: event_id("{A} {B} {C} {D} {E} {F} {G} {H}"),
+        };
+        let addr: core::net::SocketAddr = "[::1]:7".parse().unwrap();
+        let p = |name, value| Property { name, value };
+        let props = [
+            p("A", Value::U64(1)),
+            p("B", Value::I64(-2)),
+            p("C", Value::F64(0.5)),
+            p("D", Value::F64(f64::NAN)),
+            p("E", Value::Bool(true)),
+            p("F", Value::Str("tab\tcr\r\u{1}")),
+            p("G", Value::Addr(addr)),
+            p("H", Value::Duration(core::time::Duration::from_micros(1500))),
+        ];
+        let r = Record {
+            template: &T,
+            time_us: 0,
+            properties: &props,
+        };
+        let mut s = String::new();
+        write_clef(&mut s, 0, &r).unwrap();
+        assert!(s.contains(r#""@l":"Verbose""#));
+        assert!(
+            s.contains(r#""A":1,"B":-2,"C":0.5,"D":null,"E":true,"F":"tab\tcr\r\u0001","G":"[::1]:7","H":1.5"#),
+            "{s}"
+        );
+        assert_eq!(r.render().to_string(), "1 -2 0.5 NaN true tab\tcr\r\u{1} [::1]:7 1.5");
+        let mut e = String::new();
+        write!(Escaped(&mut e), "q\"b\\n\nt\tr\r\u{2}é").unwrap();
+        assert_eq!(e, "q\\\"b\\\\n\\nt\\tr\\r\\u0002é");
+    }
 
     #[test]
     fn iso8601() {

@@ -1,0 +1,17 @@
+{
+  "name": "com.netlib.transport",
+  "version": "0.0.1",
+  "displayName": "netlib Transport",
+  "description": "UDP transport for fast-paced multiplayer games: reliable and unreliable channels, MTU packing with priorities, connection migration, structured logs. Native library in Rust, C# API without managed allocations on the hot path.",
+  "unity": "6000.0",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["networking", "udp", "transport", "multiplayer"],
+  "author": { "name": "netlib contributors" },
+  "samples": [
+    {
+      "displayName": "Echo Demo",
+      "description": "Server and clients moving cubes over netlib, with RTT and log output.",
+      "path": "Samples~/EchoDemo"
+    }
+  ]
+}

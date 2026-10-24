@@ -3,3 +3,5 @@ Cargo.lock.bak
 bin/
 obj/
 *.user
+mutants.out*
+TestResults/
