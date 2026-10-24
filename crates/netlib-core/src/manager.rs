@@ -2142,8 +2142,8 @@ impl Scheduler {
             }
         }
         let r = self.plans[plan as usize].remaining;
-        if r > 0 {
-            let i = self.free.partition_point(|&e| e < (r, plan));
+        if r != 0 {
+            let i = self.free.binary_search(&(r, plan)).unwrap_or_else(|i| i);
             self.free.insert(i, (r, plan));
         }
     }
@@ -3271,5 +3271,37 @@ mod tests {
         // Dense packing: one byte of payload costs about one byte of framing.
         let total: usize = pkts.iter().map(Vec::len).sum();
         assert!(total < 600 * 3, "{total} bytes in {} packets", pkts.len());
+    }
+
+    #[test]
+    fn block_deltas_add_up_to_the_block_header() {
+        for reliable in [false, true] {
+            let mut sum = 0;
+            for n in 1..400 {
+                sum += block_delta(n - 1, reliable);
+                let base = if reliable { 2 } else { 0 };
+                assert_eq!(sum, BlockHeader::encoded_len(n) + base, "n {n}, reliable {reliable}");
+                assert!(block_delta(n, reliable) <= block_delta_max(reliable));
+            }
+        }
+    }
+
+    #[test]
+    fn fragment_pieces_fill_the_space_exactly() {
+        let piece = Piece {
+            seq: 0,
+            frag: Some((3000, 0)),
+            data: &[],
+        };
+        // Fixed cost: tag 2 + total 2 + offset 1; then a 1- or 2-byte length.
+        assert_eq!(TAG_MAX, 2);
+        assert_eq!(piece_len(&piece, true, 3000, 100), Some(94));
+        assert_eq!(piece_len(&piece, true, 3000, 200), Some(193));
+        assert_eq!(piece_len(&piece, true, 3000, 5), None);
+        // Too small to cut, unless it finishes the message.
+        assert_eq!(piece_len(&piece, true, 50, 40), None);
+        assert_eq!(piece_len(&piece, true, 30, 40), Some(30));
+        assert_eq!(piece_len(&piece, true, 30, 36), Some(30));
+        assert_eq!(piece_len(&piece, true, 30, 35), None);
     }
 }
