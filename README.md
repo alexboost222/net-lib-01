@@ -21,7 +21,7 @@ Reliable-режимы появятся в M2.
 | Крейт | Назначение |
 |-------|------------|
 | `crates/netlib-core` | sans-IO ядро (`no_std` + `alloc`, без зависимостей) |
-| `crates/netlib` | драйвер на `std::net::UdpSocket` |
+| `crates/netlib` | драйвер на `std::net::UdpSocket`; по умолчанию с потоком приёма (точное время прихода, немедленные ответы на PING), отключается через `DriverConfig::receive_thread` |
 | `crates/netlib-sim` | детерминированный эмулятор сети: потери, задержка, джиттер, дубли, полоса |
 | `xtask` | `cargo xtask report` — таблица критериев приёмки |
 
