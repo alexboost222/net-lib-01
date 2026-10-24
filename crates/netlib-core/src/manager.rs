@@ -2507,3 +2507,54 @@ fn flush_peer(
         stats.messages_stale += c.after_flush();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migrate_token_is_siphash_of_seq_with_session_key_and_conn_id() {
+        let mut h = SipHasher::new([7, 9 ^ 0x6d69_6772_6174_6521]);
+        h.write(&5u16.to_le_bytes());
+        assert_eq!(migrate_token(7, 9, 5), h.finish());
+        assert_ne!(migrate_token(7, 9, 5), migrate_token(7, 9, 6));
+        assert_ne!(migrate_token(7, 9, 5), migrate_token(8, 9, 5));
+        assert_ne!(migrate_token(7, 9, 5), migrate_token(7, 10, 5));
+    }
+
+    #[test]
+    fn logger_without_sink_is_disabled() {
+        let l = Logger::default();
+        assert!(!l.enabled(Level::Error));
+    }
+
+    #[test]
+    fn malformed_message_blocks_are_rejected() {
+        let modes = [DeliveryMode::Unreliable, DeliveryMode::ReliableOrdered];
+        let valid = |body: &[u8]| !MsgIter::new(body, &modes).any(|m| m.is_err());
+        let count = |body: &[u8]| MsgIter::new(body, &modes).filter(|m| m.is_ok()).count();
+        // Unreliable block, 2 messages: len 1 "a", tail "bc".
+        assert!(valid(&[0x50, 1, b'a', b'b', b'c']));
+        assert_eq!(count(&[0x50, 1, b'a', b'b', b'c']), 2);
+        assert!(!valid(&[0x40, 5, b'a']), "length past the end");
+        assert!(!valid(&[0x2f, 0]), "unknown channel");
+        assert!(!valid(&[0x41]), "missing length");
+        // Reliable block (channel 1): base seq 0, tag 0, len 1.
+        assert!(valid(&[0x21, 0, 0, 1, 0, b'x']));
+        // Fragment: tag 1 (delta 0, frag), total 4, offset 2, len 2.
+        assert!(valid(&[0x21, 0, 0, 2, 1, 4, 2, b'x', b'y']));
+        assert!(!valid(&[0x21, 0, 0, 2, 1, 4, 3, b'x', b'y']), "offset + len past total");
+        assert!(!valid(&[0x21, 0, 0, 2, 1, 4, 5, b'x', b'y']), "offset past total");
+        assert!(!valid(&[0x21, 0, 0, 1, 0x80, 0x80, 0x04, b'x']), "delta >= 0x8000");
+        assert!(valid(&[0x21, 0, 0, 1, 0xfe, 0xff, 0x01, b'x']), "delta 0x7fff");
+        // total > MAX_FRAGMENTED_TOTAL (2^24 + 1 as varint).
+        assert!(!valid(&[0x21, 0, 0, 1, 1, 0x81, 0x80, 0x80, 0x08, 0, b'x']));
+        assert!(
+            valid(&[0x21, 0, 0, 1, 1, 0x80, 0x80, 0x80, 0x08, 0, b'x']),
+            "total = 2^24"
+        );
+        // A failing message ends the iteration with exactly one error.
+        let errs = MsgIter::new(&[0x40, 5, b'a'], &modes).filter(|m| m.is_err()).count();
+        assert_eq!(errs, 1);
+    }
+}

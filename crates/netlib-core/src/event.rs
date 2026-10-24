@@ -87,3 +87,35 @@ pub enum Event<'a> {
         data: &'a [u8],
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peer_id_bits_roundtrip() {
+        let id = PeerId {
+            index: 0x1234_5678,
+            generation: 0x9abc_def0,
+        };
+        assert_eq!(id.to_bits(), 0x9abc_def0_1234_5678);
+        assert_eq!(PeerId::from_bits(0x9abc_def0_1234_5678), id);
+        assert_eq!(PeerId::from_bits(id.to_bits()), id);
+        assert_eq!(
+            PeerId {
+                index: 1,
+                generation: 0
+            }
+            .to_bits(),
+            1
+        );
+        assert_eq!(
+            PeerId {
+                index: 0,
+                generation: 1
+            }
+            .to_bits(),
+            1 << 32
+        );
+    }
+}

@@ -307,7 +307,28 @@ mod tests {
             c.max_message_size(DeliveryMode::ReliableSequenced),
             c.max_reliable_message
         );
-        assert!(c.single_reliable_limit() < c.mtu);
+        assert_eq!(c.single_reliable_limit(), c.mtu - 15);
+        // max_connect_data must fit a minimal-MTU CHALLENGE_RESPONSE: 576 - 24 = 552 bytes.
+        assert_eq!(check(|c| c.max_connect_data = 552), Ok(()));
+        assert_eq!(check(|c| c.max_connect_data = 553), Err(ConfigError::ConnectData));
+        assert_eq!(check(|c| c.mtu = MIN_MTU), Ok(()));
+        assert_eq!(check(|c| c.mtu = MAX_MTU), Ok(()));
+        assert_eq!(
+            check(|c| c.channels = vec![ChannelConfig::new(DeliveryMode::Unreliable); 16]),
+            Ok(())
+        );
+        assert_eq!(
+            check(|c| c.timeout = c.ping_interval + Duration::from_millis(1)),
+            Ok(())
+        );
+        assert_eq!(check(|c| c.cookie_lifetime = Duration::from_secs(1)), Ok(()));
+        assert_eq!(check(|c| c.min_rto = c.max_rto), Ok(()));
+        assert_eq!(check(|c| c.max_ack_delay = crate::wire::MAX_WIRE_ACK_DELAY), Ok(()));
+        assert_eq!(check(|c| c.max_reliable_message = 1 << 24), Ok(()));
+        assert_eq!(
+            check(|c| c.migration_probe = c.ping_interval + Duration::from_millis(1)),
+            Ok(())
+        );
         for m in [DeliveryMode::Unreliable, DeliveryMode::UnreliableSequenced] {
             assert!(!m.is_reliable());
         }
