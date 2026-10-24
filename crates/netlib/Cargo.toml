@@ -1,0 +1,15 @@
+[package]
+name = "netlib"
+description = "UDP transport for fast-paced multiplayer games"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+netlib-core.workspace = true
+getrandom = "0.4"
+
+[lints]
+workspace = true
