@@ -25,7 +25,11 @@ pub fn config(server: bool) -> Config {
 pub fn logging(m: &mut netlib::Manager) {
     use netlib::log::Level;
     use netlib::logging::{ClefSink, TextSink, WallClock};
-    let level = match std::env::var("NETLIB_LOG").unwrap_or_default().to_ascii_lowercase().as_str() {
+    let level = match std::env::var("NETLIB_LOG")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "trace" => Level::Trace,
         "debug" => Level::Debug,
         "info" => Level::Info,
