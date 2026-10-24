@@ -10,18 +10,22 @@ use netlib_core::{ChannelConfig, Config, DeliveryMode, Event, Manager, PeerId, P
 
 struct Counting;
 
-static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
-
 thread_local! {
+    // Per thread, so that tests running in parallel do not count each other.
     static COUNTING: Cell<bool> = const { Cell::new(false) };
+    static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
+}
+
+fn count() {
+    if COUNTING.with(Cell::get) {
+        ALLOCATIONS.with(|a| a.set(a.get() + 1));
+    }
 }
 
 // SAFETY: forwards to the system allocator; only counts calls.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.with(Cell::get) {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        }
+        count();
         // SAFETY: same contract as the caller's.
         unsafe { System.alloc(layout) }
     }
@@ -32,9 +36,7 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if COUNTING.with(Cell::get) {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        }
+        count();
         // SAFETY: same contract as the caller's.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
@@ -45,11 +47,11 @@ static GLOBAL: Counting = Counting;
 
 /// Counts allocations made by `f` on this thread.
 fn counted<R>(f: impl FnOnce() -> R) -> (R, u64) {
-    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let before = ALLOCATIONS.with(Cell::get);
     COUNTING.with(|c| c.set(true));
     let r = f();
     COUNTING.with(|c| c.set(false));
-    (r, ALLOCATIONS.load(Ordering::Relaxed) - before)
+    (r, ALLOCATIONS.with(Cell::get) - before)
 }
 
 const TICK: Duration = Duration::from_micros(15_625);
