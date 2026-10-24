@@ -26,9 +26,9 @@ fn session(receive_thread: bool, seconds: u64) -> (Duration, Duration, u64) {
     let peer = client.connect(server.local_addr().unwrap(), b"hi").unwrap().unwrap();
     let mut speer: Option<PeerId> = None;
     let mut echoed = 0u64;
-    let start = Instant::now();
-    let mut next = start;
-    while start.elapsed() < Duration::from_secs(seconds) {
+    // A fixed number of ticks rather than wall time: CI runners oversleep a lot.
+    let mut next = Instant::now();
+    for _ in 0..seconds * 64 {
         server.poll().unwrap();
         let mut echo = Vec::new();
         while let Some(e) = server.poll_event() {
@@ -99,10 +99,9 @@ fn m2_rebind_keeps_the_connection() {
     let mut disconnected = false;
     let old_addr = client.local_addr().unwrap();
     let mut new_addr = None;
-    let start = Instant::now();
-    let mut next = start;
-    while start.elapsed() < Duration::from_secs(3) {
-        if new_addr.is_none() && start.elapsed() > Duration::from_secs(1) {
+    let mut next = Instant::now();
+    for tick in 0..64 * 3 {
+        if tick == 64 {
             client.rebind().unwrap();
             new_addr = Some(client.local_addr().unwrap());
         }
@@ -127,7 +126,7 @@ fn m2_rebind_keeps_the_connection() {
                 disconnected = true;
             }
         }
-        if client.peer_state(peer) == Some(PeerState::Connected) && start.elapsed() < Duration::from_millis(2500) {
+        if client.peer_state(peer) == Some(PeerState::Connected) && tick < 160 {
             client.send(peer, 1, &sent.to_le_bytes()).unwrap();
             sent += 1;
         }
