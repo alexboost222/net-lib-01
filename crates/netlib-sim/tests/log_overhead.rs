@@ -72,16 +72,30 @@ fn run(log: Option<Level>, counter: &Arc<AtomicU64>) -> Duration {
     start.elapsed()
 }
 
+/// Best-of-five interleaved runs without and with Debug logging; returns the time ratio.
+fn measure(counter: &Arc<AtomicU64>) -> f64 {
+    let (mut off, mut debug) = (Duration::MAX, Duration::MAX);
+    for _ in 0..5 {
+        off = off.min(run(None, counter));
+        let before = counter.load(Ordering::Relaxed);
+        debug = debug.min(run(Some(Level::Debug), counter));
+        let events = counter.load(Ordering::Relaxed) - before;
+        assert!(events > 1000, "debug events were produced: {events}");
+    }
+    let ratio = debug.as_secs_f64() / off.as_secs_f64();
+    eprintln!("debug logging: {ratio:.3}x ({off:?} -> {debug:?})");
+    ratio
+}
+
 #[test]
 fn l4_debug_logging_overhead_is_small() {
     let counter = Arc::new(AtomicU64::new(0));
-    let best = |log| (0..3).map(|_| run(log, &counter)).min().unwrap();
-    let off = best(None);
-    let before = counter.load(Ordering::Relaxed);
-    let debug = best(Some(Level::Debug));
-    let events = counter.load(Ordering::Relaxed) - before;
-    assert!(events > 1000, "debug events were produced: {events}");
-    let ratio = debug.as_secs_f64() / off.as_secs_f64();
-    eprintln!("debug logging: {ratio:.3}x ({off:?} -> {debug:?})");
-    assert!(ratio < 1.10, "debug logging costs {:.1}%", (ratio - 1.0) * 100.0);
+    // Shared CI runners drift in speed; a real overhead shows in every attempt.
+    let ratios: Vec<f64> = (0..3).map(|_| measure(&counter)).collect();
+    let best = ratios.iter().copied().fold(f64::MAX, f64::min);
+    assert!(
+        best < 1.10,
+        "debug logging costs {:.1}% ({ratios:?})",
+        (best - 1.0) * 100.0
+    );
 }

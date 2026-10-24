@@ -117,10 +117,21 @@ pub fn meta(rel: &str, is_dir: bool) -> String {
 /// The binding's `Native.cs` resolves functions from the process itself when built with
 /// `NETLIB_STATIC`; in Unity that is the iOS player (IL2CPP links the static library).
 pub fn patch_native(source: &str) -> String {
-    source.replace(
-        "#if NETLIB_STATIC\n",
-        "#if NETLIB_STATIC || (UNITY_IOS && !UNITY_EDITOR)\n",
-    )
+    // Line by line: a Windows checkout has CRLF line endings.
+    source
+        .split_inclusive('\n')
+        .map(|line| {
+            if line.trim_end() == "#if NETLIB_STATIC" {
+                line.replacen(
+                    "#if NETLIB_STATIC",
+                    "#if NETLIB_STATIC || (UNITY_IOS && !UNITY_EDITOR)",
+                    1,
+                )
+            } else {
+                line.to_string()
+            }
+        })
+        .collect()
 }
 
 fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -343,6 +354,14 @@ mod tests {
             "the runtime does not use UnityEngine"
         );
         let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn native_patch_keeps_line_endings() {
+        let want = "#if NETLIB_STATIC || (UNITY_IOS && !UNITY_EDITOR)";
+        assert_eq!(patch_native("a\n#if NETLIB_STATIC\nb\n"), format!("a\n{want}\nb\n"));
+        assert_eq!(patch_native("a\r\n#if NETLIB_STATIC\r\nb"), format!("a\r\n{want}\r\nb"));
+        assert_eq!(patch_native("#if NETLIB_STATIC_X\n"), "#if NETLIB_STATIC_X\n");
     }
 
     #[test]
