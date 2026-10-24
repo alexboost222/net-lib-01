@@ -80,6 +80,7 @@ fn echo_over_localhost_with_receive_thread() {
 fn echo_over_localhost_without_receive_thread() {
     let (client_rtt, _, echoed) = session(false, 2);
     assert!(echoed > 50, "echoed {echoed}");
-    // Without arrival timestamps the wait for the next poll is part of the RTT.
-    assert!(client_rtt < TICK * 2, "{client_rtt:?}");
+    // Without arrival timestamps the wait for the next poll is part of the RTT, and with it
+    // the scheduling noise of `sleep` (tens of ms on CI macOS runners), so only a loose bound.
+    assert!(client_rtt < Duration::from_millis(100), "{client_rtt:?}");
 }
