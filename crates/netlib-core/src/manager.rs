@@ -2511,6 +2511,7 @@ fn flush_peer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ChannelConfig;
 
     #[test]
     fn migrate_token_is_siphash_of_seq_with_session_key_and_conn_id() {
@@ -2556,5 +2557,302 @@ mod tests {
         // A failing message ends the iteration with exactly one error.
         let errs = MsgIter::new(&[0x40, 5, b'a'], &modes).filter(|m| m.is_err()).count();
         assert_eq!(errs, 1);
+    }
+
+    // ---- Forged control packets: each must be dropped (and counted) without effect. ----
+
+    const S: SocketAddr = SocketAddr::new(core::net::IpAddr::V4(core::net::Ipv4Addr::new(10, 0, 0, 1)), 9000);
+    const C: SocketAddr = SocketAddr::new(core::net::IpAddr::V4(core::net::Ipv4Addr::new(10, 0, 0, 2)), 5000);
+    const C2: SocketAddr = SocketAddr::new(core::net::IpAddr::V4(core::net::Ipv4Addr::new(10, 0, 0, 2)), 5001);
+
+    fn drain(m: &mut Manager) -> Vec<Vec<u8>> {
+        let mut buf = [0u8; 2048];
+        let mut out = Vec::new();
+        while let Some((_, n)) = m.poll_transmit(&mut buf) {
+            out.push(buf[..n].to_vec());
+        }
+        out
+    }
+
+    fn enc(c: &Control<'_>) -> Vec<u8> {
+        let mut b = [0u8; 1500];
+        let n = c.encode(&mut b).unwrap();
+        b[..n].to_vec()
+    }
+
+    /// Whether `m` dropped `pkt` (counted in `datagrams_dropped`).
+    fn dropped(m: &mut Manager, now: Time, from: SocketAddr, pkt: &[u8]) -> bool {
+        let d = m.stats().datagrams_dropped;
+        m.handle_datagram(now, from, pkt);
+        m.stats().datagrams_dropped == d + 1
+    }
+
+    fn deliver(m: &mut Manager, now: Time, from: SocketAddr, pkts: &[Vec<u8>]) {
+        for p in pkts {
+            assert!(!dropped(m, now, from, p), "valid packet type {} dropped", p[0] & 0x0f);
+        }
+    }
+
+    fn server() -> Manager {
+        let config = Config {
+            accept_incoming: true,
+            ..Config::default()
+        };
+        Manager::new(config, [1; 32], Time::from_micros(0)).unwrap()
+    }
+
+    fn client() -> Manager {
+        Manager::new(Config::default(), [2; 32], Time::from_micros(0)).unwrap()
+    }
+
+    fn accept_all(m: &mut Manager, now: Time) {
+        let mut pending = Vec::new();
+        while let Some(e) = m.poll_event() {
+            if let Event::ConnectRequest { peer, .. } = e {
+                pending.push(peer);
+            }
+        }
+        for p in pending {
+            m.accept(now, p).unwrap();
+        }
+    }
+
+    #[test]
+    fn forged_handshake_packets_are_dropped() {
+        // Late start: a cookie age computed as `now + timestamp` would be expired.
+        let t = Time::from_millis(30_000);
+        let (mut s, mut c) = (server(), client());
+        assert!(dropped(&mut s, t, C, &[]), "empty datagram");
+        let mtu = s.config().mtu;
+        assert!(dropped(&mut s, t, C, &vec![0u8; mtu + 1]), "oversized datagram");
+        assert_eq!(s.stats().datagrams_received, 2);
+        assert_eq!(s.stats().datagrams_dropped, 2);
+
+        let id = c.connect(t, S, b"hi").unwrap();
+        c.flush(t);
+        let req = drain(&mut c);
+        let Some(Control::ConnectRequest { nonce, .. }) = Control::decode(&req[0]) else {
+            panic!("no CONNECT_REQUEST");
+        };
+        // ACCEPT and REJECT before the challenge, with the right nonce.
+        let accept = |nonce| {
+            enc(&Control::Accept {
+                nonce,
+                conn_id: 1,
+                session_key: 1,
+            })
+        };
+        assert!(dropped(&mut c, t, S, &accept(nonce)), "ACCEPT while connecting");
+        assert!(dropped(&mut c, t, C2, &accept(nonce)), "ACCEPT from an unknown address");
+        deliver(&mut s, t, C, &req);
+        let chal = drain(&mut s);
+        let Some(Control::Challenge { timestamp, mac, .. }) = Control::decode(&chal[0]) else {
+            panic!("no CHALLENGE");
+        };
+        let forged = enc(&Control::Challenge {
+            nonce: nonce ^ 1,
+            timestamp,
+            mac,
+        });
+        assert!(dropped(&mut c, t, S, &forged), "CHALLENGE with a wrong nonce");
+        assert!(dropped(&mut s, t, C, &chal[0]), "CHALLENGE to the server");
+        deliver(&mut c, t, S, &chal);
+        assert!(dropped(&mut c, t, S, &accept(nonce ^ 1)), "ACCEPT with a wrong nonce");
+        let resp = drain(&mut c);
+
+        // CHALLENGE_RESPONSE: the cookie does not cover the data, the size limit must hold.
+        let max = s.config().max_connect_data;
+        let big = vec![0u8; max + 1];
+        let response = |data| {
+            enc(&Control::ChallengeResponse {
+                nonce,
+                timestamp,
+                mac,
+                data,
+            })
+        };
+        assert!(dropped(&mut s, t, C, &response(&big)), "connect data over the limit");
+        assert_eq!(s.stats().invalid_cookies, 0);
+        assert!(dropped(&mut s, t, C2, &resp[0]), "cookie bound to another address");
+        assert_eq!(s.stats().invalid_cookies, 1);
+        assert!(
+            !dropped(&mut s, t, C, &response(&big[..max])),
+            "connect data at the limit"
+        );
+        accept_all(&mut s, t);
+        let acc = drain(&mut s);
+        let Some(Control::Accept { conn_id, .. }) = Control::decode(&acc[0]) else {
+            panic!("no ACCEPT");
+        };
+        deliver(&mut c, t, S, &acc);
+        assert_eq!(c.peer_state(id), Some(PeerState::Connected));
+
+        // Connected: handshake packets and wrong-role packets are ignored.
+        let reject = enc(&Control::Reject {
+            nonce,
+            reason: REJECT_BY_APP,
+            data: &[],
+        });
+        assert!(dropped(&mut c, t, S, &reject), "REJECT after connecting");
+        assert!(dropped(&mut c, t, S, &acc[0]), "repeated ACCEPT");
+        assert!(dropped(&mut c, t, S, &chal[0]), "CHALLENGE after connecting");
+        assert!(
+            dropped(&mut s, t, C, &enc(&Control::WhoAreYou)),
+            "WHO_ARE_YOU to the server"
+        );
+        let pc = enc(&Control::PathChallenge { challenge: 5 });
+        assert!(dropped(&mut s, t, C, &pc), "PATH_CHALLENGE to the server");
+        assert!(
+            dropped(&mut s, t, C, &enc(&Control::PathResponse { challenge: 5 })),
+            "unsolicited PATH_RESPONSE"
+        );
+        assert!(!dropped(&mut c, t, S, &pc));
+        assert_eq!(
+            Control::decode(&drain(&mut c)[0]),
+            Some(Control::PathResponse { challenge: 5 })
+        );
+        let disc = |conn_id| enc(&Control::Disconnect { conn_id, data: b"bye" });
+        assert!(
+            dropped(&mut c, t, S, &disc(conn_id ^ 1)),
+            "DISCONNECT with a wrong conn_id"
+        );
+        assert_eq!(c.peer_state(id), Some(PeerState::Connected));
+        assert!(!dropped(&mut c, t, S, &disc(conn_id)));
+        assert_eq!(c.peer_state(id), None);
+        assert_eq!(c.stats().datagrams_received, c.stats().datagrams_dropped + 4);
+    }
+
+    #[test]
+    fn reject_reasons_are_reported() {
+        let t = Time::from_millis(1);
+        for (code, want) in [
+            (REJECT_SERVER_FULL, "ServerFull"),
+            (REJECT_VERSION_MISMATCH, "VersionMismatch"),
+            (REJECT_BY_APP, "Rejected"),
+        ] {
+            let mut c = client();
+            c.connect(t, S, &[]).unwrap();
+            c.flush(t);
+            let Some(Control::ConnectRequest { nonce, .. }) = Control::decode(&drain(&mut c)[0]) else {
+                panic!("no CONNECT_REQUEST");
+            };
+            let reject = |nonce| {
+                enc(&Control::Reject {
+                    nonce,
+                    reason: code,
+                    data: b"no",
+                })
+            };
+            assert!(dropped(&mut c, t, S, &reject(nonce ^ 1)), "REJECT with a wrong nonce");
+            assert!(!dropped(&mut c, t, S, &reject(nonce)));
+            let reason = loop {
+                match c.poll_event() {
+                    Some(Event::Disconnected { reason, .. }) => break alloc::format!("{reason:?}"),
+                    Some(_) => {}
+                    None => panic!("no Disconnected"),
+                }
+            };
+            assert!(reason.starts_with(want), "{reason} for code {code}");
+        }
+    }
+
+    /// Runs `rounds` exchanges between a client seen at `seen` and the server.
+    fn exchange(s: &mut Manager, c: &mut Manager, seen: SocketAddr, t: &mut Time, rounds: usize) {
+        for _ in 0..rounds {
+            *t = *t + Duration::from_millis(10);
+            c.update(*t);
+            c.flush(*t);
+            for p in drain(c) {
+                s.handle_datagram(*t, seen, &p);
+            }
+            accept_all(s, *t);
+            s.update(*t);
+            s.flush(*t);
+            for p in drain(s) {
+                c.handle_datagram(*t, S, &p);
+            }
+            while c.poll_event().is_some() {}
+        }
+    }
+
+    #[test]
+    fn migration_counts_no_valid_packet_as_dropped() {
+        let mut t = Time::from_millis(1);
+        let (mut s, mut c) = (server(), client());
+        let id = c.connect(t, S, &[]).unwrap();
+        exchange(&mut s, &mut c, C, &mut t, 5);
+        assert_eq!(c.peer_state(id), Some(PeerState::Connected));
+        assert_eq!(s.stats().datagrams_dropped, 0);
+        assert_eq!(s.by_conn.len(), 1);
+        // NAT rebinding: the first packet from C2 gets WHO_ARE_YOU, the rest migrate.
+        for _ in 0..10 {
+            c.send(id, 0, b"x").unwrap();
+            exchange(&mut s, &mut c, C2, &mut t, 1);
+        }
+        assert_eq!(s.stats().migrations, 1);
+        assert_eq!(s.stats().failed_path_validations, 0);
+        let server_peer = s.peers().next().unwrap();
+        assert_eq!(s.peer_addr(server_peer), Some(C2));
+        let dropped_by_server = s.stats().datagrams_dropped;
+        assert!(
+            dropped_by_server <= 1,
+            "only the packet answered by WHO_ARE_YOU: {dropped_by_server}"
+        );
+        assert_eq!(s.stats().who_are_you_sent, dropped_by_server);
+        assert!(s.by_addr.get(&C).is_none());
+        // Disconnect frees every index.
+        s.disconnect(server_peer, &[]).unwrap();
+        assert!(s.by_conn.is_empty());
+        assert!(s.by_addr.is_empty());
+    }
+
+    #[test]
+    fn queued_messages_counts_per_channel() {
+        let mut t = Time::from_millis(1);
+        let config = Config {
+            channels: vec![
+                ChannelConfig::new(DeliveryMode::Unreliable),
+                ChannelConfig::new(DeliveryMode::ReliableOrdered),
+            ],
+            ..Config::default()
+        };
+        let mut s = Manager::new(
+            Config {
+                accept_incoming: true,
+                ..config.clone()
+            },
+            [1; 32],
+            t,
+        )
+        .unwrap();
+        let mut c = Manager::new(config, [2; 32], t).unwrap();
+        let id = c.connect(t, S, &[]).unwrap();
+        exchange(&mut s, &mut c, C, &mut t, 5);
+        for _ in 0..2 {
+            c.send(id, 0, b"u").unwrap();
+        }
+        for _ in 0..3 {
+            c.send(id, 1, b"r").unwrap();
+        }
+        assert_eq!(c.queued_messages(id, 0), Some(2));
+        assert_eq!(c.queued_messages(id, 1), Some(3));
+        assert_eq!(c.queued_messages(id, 2), None);
+        c.flush(t);
+        let sent = drain(&mut c);
+        assert_eq!(c.queued_messages(id, 0), Some(0));
+        assert_eq!(c.queued_messages(id, 1), Some(3), "reliable until acknowledged");
+        deliver(&mut s, t, C, &sent);
+        // A datagram of exactly the MTU is accepted: seq 1000, one unreliable tail message.
+        let mtu = s.config().mtu;
+        let mut full = vec![TYPE_DATA, 0xe8, 0x03, 0x30];
+        full.resize(mtu, 7);
+        deliver(&mut s, t, C, &[full]);
+        let mut sizes = Vec::new();
+        while let Some(e) = s.poll_event() {
+            if let Event::Message { data, .. } = e {
+                sizes.push(data.len());
+            }
+        }
+        assert_eq!(sizes, [1, 1, 1, 1, 1, mtu - 4]);
     }
 }

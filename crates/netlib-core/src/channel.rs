@@ -124,7 +124,7 @@ enum Slot {
 
 struct Partial {
     buf: Vec<u8>,
-    /// Received ranges, sorted and merged.
+    /// Received ranges, merged (in no particular order).
     ranges: Vec<(u32, u32)>,
 }
 
@@ -145,8 +145,7 @@ impl Partial {
                 false
             }
         });
-        let pos = self.ranges.partition_point(|&(rs, _)| rs < s);
-        self.ranges.insert(pos, (s, e));
+        self.ranges.push((s, e));
         true
     }
 
@@ -899,5 +898,67 @@ mod tests {
         assert_eq!(backoff(ms * 100, 2, ms * 2000), ms * 400);
         assert_eq!(backoff(ms * 100, 9, ms * 2000), ms * 800);
         assert_eq!(backoff(ms * 400, 9, ms * 2000), ms * 2000);
+    }
+
+    fn reliable_cands(ch: &mut Channel, now: Time) -> Vec<(u32, u32)> {
+        collect(ch, now).iter().map(|c| (c.start, c.end)).collect()
+    }
+
+    #[test]
+    fn fragmenting_starts_above_the_single_limit() {
+        let mut ch = Channel::new(DeliveryMode::ReliableOrdered);
+        let now = Time::from_millis(1);
+        ch.queue_reliable(&[0; 100], 100, now, 128);
+        ch.queue_reliable(&[0; 101], 100, now, 128);
+        assert!(!ch.out[0].fragmented);
+        assert!(ch.out[1].fragmented);
+    }
+
+    #[test]
+    fn partially_sent_message_offers_its_remainder() {
+        let mut ch = Channel::new(DeliveryMode::ReliableOrdered);
+        let now = Time::from_millis(1);
+        ch.queue_reliable(&[0; 3000], 1000, now, 128);
+        let c = collect(&mut ch, now)[0];
+        assert_eq!((c.start, c.end), (0, 3000));
+        ch.mark_sent(c.kind, 0, 1000, now, 1);
+        assert_eq!(reliable_cands(&mut ch, now), [(1000, 3000)]);
+    }
+
+    #[test]
+    fn late_loss_of_an_old_packet_spares_the_retransmission() {
+        let mut ch = Channel::new(DeliveryMode::ReliableOrdered);
+        let now = Time::from_millis(1);
+        ch.queue_reliable(b"abc", 1000, now, 128);
+        let kind = collect(&mut ch, now)[0].kind;
+        ch.mark_sent(kind, 0, 3, now, 1);
+        assert!(reliable_cands(&mut ch, now).is_empty());
+        ch.on_lost(0, 0, 7);
+        assert!(
+            reliable_cands(&mut ch, now).is_empty(),
+            "loss of a packet that did not carry it"
+        );
+        ch.on_lost(0, 0, 1);
+        assert_eq!(reliable_cands(&mut ch, now), [(0, 3)]);
+        ch.mark_sent(kind, 0, 3, now, 2);
+        // Packet 1 is reported lost again (e.g. by the RTO path): packet 2 is still in flight.
+        ch.on_lost(0, 0, 1);
+        assert!(reliable_cands(&mut ch, now).is_empty());
+        ch.on_acked(0, 0);
+        ch.on_lost(0, 0, 2);
+        assert!(
+            reliable_cands(&mut ch, now).is_empty(),
+            "acknowledged chunks are never lost"
+        );
+    }
+
+    #[test]
+    fn last_fragment_may_end_at_the_total() {
+        let mut ch = Channel::new(DeliveryMode::ReliableOrdered);
+        let mut out = Vec::new();
+        assert_eq!(recv(&mut ch, 0, Some((4, 2)), b"cd", &mut out), Received::Fragment);
+        assert_eq!(recv(&mut ch, 0, Some((4, 0)), b"ab", &mut out), Received::Accepted);
+        assert_eq!(out, vec![b"abcd".to_vec()]);
+        assert_eq!(recv(&mut ch, 1, Some((4, 3)), b"de", &mut out), Received::Dropped);
     }
 }
