@@ -1,6 +1,7 @@
 //! Byte-level encoding of datagrams. See `docs/WIRE_FORMAT.md`.
 
 use core::net::SocketAddr;
+use core::time::Duration;
 
 pub(crate) const WIRE_VERSION: u16 = 0;
 
@@ -18,8 +19,30 @@ const KNOWN_DATA_FLAGS: u8 = FLAG_ACK | FLAG_PING;
 
 /// `CONNECT_REQUEST` is padded to this size so that every pre-validation reply is smaller.
 pub(crate) const CONNECT_REQUEST_SIZE: usize = 32;
-/// Data header with an ack block: type/flags + seq + ack + ack_bits.
-pub(crate) const DATA_HEADER_MAX: usize = 7;
+/// Data header with an ack block: type/flags + seq + ack + ack_bits + ack_delay.
+pub(crate) const DATA_HEADER_MAX: usize = 8;
+
+/// Largest ack delay representable on the wire.
+pub(crate) const MAX_WIRE_ACK_DELAY: Duration = Duration::from_millis(159);
+
+/// Encodes an ack delay into one byte, rounding down so the delay is never overstated:
+/// `0..=127` are steps of 250 µs (0–31.75 ms), `128..=255` are 32 ms plus steps of 1 ms (up to 159 ms).
+pub(crate) fn encode_ack_delay(d: Duration) -> u8 {
+    let us = d.as_micros();
+    if us < 32_000 {
+        (us / 250) as u8
+    } else {
+        128 + ((us - 32_000) / 1000).min(127) as u8
+    }
+}
+
+pub(crate) fn decode_ack_delay(v: u8) -> Duration {
+    if v < 128 {
+        Duration::from_micros(u64::from(v) * 250)
+    } else {
+        Duration::from_millis(32 + u64::from(v - 128))
+    }
+}
 
 pub(crate) const REJECT_BY_APP: u8 = 0;
 pub(crate) const REJECT_SERVER_FULL: u8 = 1;
@@ -354,8 +377,9 @@ impl Control<'_> {
 pub(crate) struct DataHeader {
     pub(crate) flags: u8,
     pub(crate) seq: u16,
-    /// `(ack, ack_bits)` when `FLAG_ACK` is set.
-    pub(crate) ack: Option<(u16, u16)>,
+    /// `(ack, ack_bits, ack_delay)` when `FLAG_ACK` is set; `ack_delay` is encoded
+    /// with [`encode_ack_delay`].
+    pub(crate) ack: Option<(u16, u16, u8)>,
 }
 
 impl DataHeader {
@@ -366,9 +390,10 @@ impl DataHeader {
         }
         w.u8(flags | TYPE_DATA)?;
         w.u16(self.seq)?;
-        if let Some((ack, bits)) = self.ack {
+        if let Some((ack, bits, delay)) = self.ack {
             w.u16(ack)?;
             w.u16(bits)?;
+            w.u8(delay)?;
         }
         Ok(())
     }
@@ -381,7 +406,7 @@ impl DataHeader {
         let flags = b0 & 0xf0;
         let seq = r.u16()?;
         let ack = if flags & FLAG_ACK != 0 {
-            Some((r.u16()?, r.u16()?))
+            Some((r.u16()?, r.u16()?, r.u8()?))
         } else {
             None
         };
@@ -477,7 +502,7 @@ mod tests {
         let h = DataHeader {
             flags: FLAG_PING,
             seq: 65535,
-            ack: Some((65000, 0xbeef)),
+            ack: Some((65000, 0xbeef, 200)),
         };
         h.encode(&mut w).unwrap();
         let n = w.pos();
@@ -485,8 +510,27 @@ mod tests {
         let mut r = Reader::new(&buf[..n]);
         let d = DataHeader::decode(&mut r).unwrap();
         assert_eq!(d.seq, 65535);
-        assert_eq!(d.ack, Some((65000, 0xbeef)));
+        assert_eq!(d.ack, Some((65000, 0xbeef, 200)));
         assert_eq!(d.flags, FLAG_PING | FLAG_ACK);
+    }
+
+    #[test]
+    fn ack_delay_encoding_rounds_down_and_saturates() {
+        let mut prev = Duration::ZERO;
+        for v in 0..=255u8 {
+            let d = decode_ack_delay(v);
+            assert_eq!(encode_ack_delay(d), v, "{v}");
+            assert!(v == 0 || d > prev, "monotonic at {v}");
+            prev = d;
+        }
+        assert_eq!(decode_ack_delay(255), MAX_WIRE_ACK_DELAY);
+        assert_eq!(encode_ack_delay(Duration::from_secs(5)), 255);
+        for us in [0u64, 249, 250, 31_999, 32_000, 32_999, 100_500, 158_999] {
+            let d = Duration::from_micros(us);
+            let back = decode_ack_delay(encode_ack_delay(d));
+            assert!(back <= d, "{us}: never overstated");
+            assert!(d - back < Duration::from_millis(1), "{us}: precision");
+        }
     }
 
     #[test]

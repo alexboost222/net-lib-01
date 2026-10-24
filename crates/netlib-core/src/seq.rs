@@ -54,6 +54,11 @@ impl RecvWindow {
         }
     }
 
+    /// Highest sequence number received so far.
+    pub(crate) fn latest(&self) -> Option<u16> {
+        self.latest
+    }
+
     /// Classifies `seq` without recording it.
     pub(crate) fn check(&self, seq: u16) -> Received {
         match self.latest {

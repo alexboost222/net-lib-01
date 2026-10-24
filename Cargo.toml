@@ -10,9 +10,9 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/alexboost222/net-lib-01"
 
 [workspace.dependencies]
-netlib-core = { path = "crates/netlib-core" }
-netlib = { path = "crates/netlib" }
-netlib-sim = { path = "crates/netlib-sim" }
+netlib-core = { path = "crates/netlib-core", version = "0.0.1" }
+netlib = { path = "crates/netlib", version = "0.0.1" }
+netlib-sim = { path = "crates/netlib-sim", version = "0.0.1" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

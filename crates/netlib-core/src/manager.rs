@@ -12,7 +12,7 @@ use crate::siphash::{Rng, SipHasher};
 use crate::time::Time;
 use crate::wire::{
     BlockHeader, Control, DataHeader, FLAG_PING, REJECT_BY_APP, REJECT_SERVER_FULL, REJECT_VERSION_MISMATCH, Reader,
-    TYPE_DATA, WIRE_VERSION, Writer, encode_addr, varint_len,
+    TYPE_DATA, WIRE_VERSION, Writer, decode_ack_delay, encode_ack_delay, encode_addr, varint_len,
 };
 
 /// Packets remembered for ack processing and RTT measurement.
@@ -89,6 +89,8 @@ pub struct PeerStats {
     pub bytes_received: u64,
     /// DATA packets without messages sent only to carry an ack.
     pub standalone_acks_sent: u64,
+    /// Immediate acks sent in reply to PING packets; they give RTT samples without ack delay.
+    pub ping_acks_sent: u64,
     /// Sent DATA packets confirmed by the remote side.
     pub packets_acked: u64,
     /// Duplicate or too old DATA packets dropped.
@@ -165,6 +167,10 @@ struct Peer {
     last_recv: Time,
     last_send: Time,
     last_ping: Time,
+    /// When the packet with the highest seq so far arrived; the base of the reported ack delay.
+    largest_recv_time: Time,
+    /// Last immediate reply to a PING, for rate limiting.
+    last_ping_ack: Option<Time>,
     next_seq: u16,
     recv: RecvWindow,
     received_any: bool,
@@ -189,6 +195,8 @@ impl Peer {
             last_recv: now,
             last_send: now,
             last_ping: now,
+            largest_recv_time: now,
+            last_ping_ack: None,
             next_seq: 0,
             recv: RecvWindow::default(),
             received_any: false,
@@ -898,7 +906,12 @@ impl Manager {
         };
         let id = self.id_of(index);
         let Manager {
-            slots, events, stats, ..
+            slots,
+            events,
+            stats,
+            config,
+            tx,
+            ..
         } = self;
         let Some(peer) = slots[index as usize].peer.as_mut() else {
             return;
@@ -918,6 +931,7 @@ impl Manager {
             peer.stats.packets_malformed += 1;
             return;
         }
+        let largest = peer.recv.latest();
         match peer.recv.insert(header.seq) {
             Received::New => {}
             Received::Duplicate | Received::TooOld => {
@@ -925,16 +939,25 @@ impl Manager {
                 return;
             }
         }
+        if largest.is_none_or(|l| seq_newer(header.seq, l)) {
+            peer.largest_recv_time = now;
+        }
         peer.last_recv = now;
         peer.received_any = true;
         peer.ack_repeat = ACK_REPEAT;
         peer.stats.packets_received += 1;
         peer.stats.bytes_received += data.len() as u64;
-        if header.flags & FLAG_PING != 0 {
-            peer.ack_pending = true;
+        if let Some((ack, bits, delay)) = header.ack {
+            process_acks(peer, now, ack, bits, decode_ack_delay(delay), config.max_ack_delay);
         }
-        if let Some((ack, bits)) = header.ack {
-            process_acks(peer, now, ack, bits);
+        let ping_ack_allowed = peer.last_ping_ack.is_none_or(|t| now - t >= config.ping_interval / 4);
+        if header.flags & FLAG_PING != 0 && !ping_ack_allowed {
+            peer.ack_pending = true;
+        } else if header.flags & FLAG_PING != 0 {
+            peer.last_ping_ack = Some(now);
+            // Answer at once: a sample without ack delay keeps min_rtt honest, which bounds
+            // how far reported ack delays may lower the RTT estimate.
+            send_ping_ack(peer, now, config.mtu, tx);
         }
         let Peer { channels, stats, .. } = peer;
         let mut iter = MsgIter::new(body, channels);
@@ -1123,9 +1146,21 @@ impl Manager {
         self.peer(id).map(|p| p.addr)
     }
 
-    /// Smoothed round-trip time, once measured.
+    /// Smoothed network round-trip time, once measured. The time the remote side held
+    /// acks before sending them is excluded, so the value does not depend on its tick rate.
     pub fn peer_rtt(&self, id: PeerId) -> Option<Duration> {
         self.peer(id)?.rtt.srtt()
+    }
+
+    /// Smallest raw RTT sample: a lower bound of the network RTT.
+    pub fn peer_min_rtt(&self, id: PeerId) -> Option<Duration> {
+        self.peer(id)?.rtt.min_rtt()
+    }
+
+    /// Mean deviation of the network RTT (jitter estimate).
+    pub fn peer_rtt_var(&self, id: PeerId) -> Option<Duration> {
+        let p = self.peer(id)?;
+        p.rtt.srtt().map(|_| p.rtt.rttvar())
     }
 
     /// Current retransmission timeout.
@@ -1133,7 +1168,7 @@ impl Manager {
         Some(self.peer(id)?.rtt.rto())
     }
 
-    /// Latest raw RTT sample.
+    /// Latest network RTT sample (ack delay excluded).
     pub fn peer_latest_rtt(&self, id: PeerId) -> Option<Duration> {
         let p = self.peer(id)?;
         p.rtt.srtt().map(|_| p.rtt.latest())
@@ -1157,7 +1192,7 @@ impl Manager {
     }
 }
 
-fn process_acks(peer: &mut Peer, now: Time, ack: u16, bits: u16) {
+fn process_acks(peer: &mut Peer, now: Time, ack: u16, bits: u16, ack_delay: Duration, max_ack_delay: Duration) {
     // An ack for a packet we have not sent yet is bogus.
     let last_sent = peer.next_seq.wrapping_sub(1);
     if peer.stats.packets_sent == 0 || seq_newer(ack, last_sent) {
@@ -1173,10 +1208,40 @@ fn process_acks(peer: &mut Peer, now: Time, ack: u16, bits: u16) {
             slot.acked = true;
             peer.stats.packets_acked += 1;
             if i == 0 {
-                peer.rtt.sample(now - slot.time);
+                peer.rtt.on_ack(now - slot.time, ack_delay, max_ack_delay);
             }
         }
     }
+}
+
+fn send_ping_ack(peer: &mut Peer, now: Time, mtu: usize, tx: &mut TxQueue) {
+    let Some((ack, bits)) = peer.recv.ack() else {
+        return;
+    };
+    let seq = peer.next_seq;
+    let header = DataHeader {
+        flags: 0,
+        seq,
+        ack: Some((ack, bits, encode_ack_delay(now - peer.largest_recv_time))),
+    };
+    let start = tx.reserve(mtu);
+    let mut w = Writer::new(&mut tx.bytes[start..start + mtu]);
+    if header.encode(&mut w).is_err() {
+        tx.bytes.truncate(start);
+        return;
+    }
+    let len = w.pos();
+    tx.commit(peer.addr, start, len);
+    peer.sent[usize::from(seq) % SENT_RING] = SentPacket {
+        seq,
+        time: now,
+        in_use: true,
+        acked: false,
+    };
+    peer.next_seq = seq.wrapping_add(1);
+    peer.stats.packets_sent += 1;
+    peer.stats.bytes_sent += len as u64;
+    peer.stats.ping_acks_sent += 1;
 }
 
 /// Length of the first queued message of the first non-empty channel at or after `from`.
@@ -1193,7 +1258,9 @@ fn flush_peer(peer: &mut Peer, now: Time, config: &Config, tx: &mut TxQueue) {
         return;
     }
     let ack = if peer.received_any && (peer.ack_pending || peer.ack_repeat > 0) {
-        peer.recv.ack()
+        peer.recv
+            .ack()
+            .map(|(ack, bits)| (ack, bits, encode_ack_delay(now - peer.largest_recv_time)))
     } else {
         None
     };

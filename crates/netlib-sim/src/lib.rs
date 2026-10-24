@@ -172,11 +172,15 @@ impl Sim {
     /// Moves every queued outgoing datagram of every node onto the network.
     pub fn transmit(&mut self) {
         for i in 0..self.nodes.len() {
-            while let Some((to, len)) = self.nodes[i].manager.poll_transmit(&mut self.buf) {
-                let data = self.buf[..len].to_vec();
-                let from = self.nodes[i].addr;
-                self.inject(i, from, to, data);
-            }
+            self.transmit_node(i);
+        }
+    }
+
+    fn transmit_node(&mut self, i: usize) {
+        while let Some((to, len)) = self.nodes[i].manager.poll_transmit(&mut self.buf) {
+            let data = self.buf[..len].to_vec();
+            let from = self.nodes[i].addr;
+            self.inject(i, from, to, data);
         }
     }
 
@@ -234,10 +238,13 @@ impl Sim {
             }
             let Reverse(d) = self.in_flight.pop().expect("peeked");
             self.now = self.now.max(d.deliver_at);
-            match self.nodes.iter_mut().find(|n| n.addr == d.to) {
-                Some(node) => {
+            match self.nodes.iter().position(|n| n.addr == d.to) {
+                Some(i) => {
                     self.stats.delivered += 1;
-                    node.manager.handle_datagram(self.now, d.from, &d.data);
+                    self.nodes[i].manager.handle_datagram(self.now, d.from, &d.data);
+                    // Replies produced while handling (handshake, ping acks) leave at once,
+                    // like a driver that transmits at the end of its receive loop.
+                    self.transmit_node(i);
                 }
                 None => self.stats.unroutable += 1,
             }

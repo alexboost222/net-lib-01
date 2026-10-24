@@ -421,11 +421,51 @@ fn rtt_is_measured_from_acks() {
             log[i].extend(drain(m));
         });
     }
-    let rtt = sim.nodes[1].manager.peer_rtt(peer).unwrap();
-    // 100 ms of wire time plus up to one tick of ack delay on each side.
+    // The ack delay (up to one tick) is reported and subtracted: only wire time remains.
+    let ms = Duration::from_millis(1);
+    for (node, p) in [(1, peer), (0, speer)] {
+        let rtt = sim.nodes[node].manager.peer_rtt(p).unwrap();
+        assert!(rtt >= ms * 100 && rtt <= ms * 101, "node {node}: {rtt:?}");
+    }
+    // Retransmission timing still accounts for the time acks really take.
+    let rto = sim.nodes[1].manager.peer_rto(peer).unwrap();
+    assert!(rto > ms * 101, "{rto:?}");
+}
+
+#[test]
+fn rtt_does_not_depend_on_remote_frame_rate() {
+    // Server at 64 Hz, client flushing at 16 fps (a 62.5 ms frame): before ack delay was
+    // reported, the server saw up to +62 ms of RTT for this client.
+    let link = Link {
+        latency: Duration::from_millis(40),
+        jitter: Duration::from_millis(4),
+        ..Link::default()
+    };
+    let (mut sim, peer, mut log) = connected_pair(18, link);
+    let speer = server_peer(&log);
+    for tick in 0..64 * 20u32 {
+        sim.advance(TICK);
+        for (i, l) in log.iter_mut().enumerate() {
+            let now = sim.now;
+            let m = sim.manager(i);
+            l.extend(drain(m));
+            if i == 0 || tick % 4 == 0 {
+                m.send(if i == 0 { speer } else { peer }, 0, &[1]).unwrap();
+                m.flush(now);
+            }
+        }
+        sim.transmit();
+    }
+    let ms = Duration::from_millis(1);
+    let server_view = sim.nodes[0].manager.peer_rtt(speer).unwrap();
+    let client_view = sim.nodes[1].manager.peer_rtt(peer).unwrap();
+    // 80 ms of base latency plus on average 4 ms of jitter over the two directions.
+    for (who, rtt) in [("server", server_view), ("client", client_view)] {
+        assert!(rtt >= ms * 80 && rtt <= ms * 88, "{who}: {rtt:?}");
+    }
     assert!(
-        rtt >= Duration::from_millis(100) && rtt <= Duration::from_millis(100) + TICK * 2,
-        "{rtt:?}"
+        server_view.abs_diff(client_view) < ms * 4,
+        "{server_view:?} vs {client_view:?}"
     );
 }
 
@@ -446,14 +486,14 @@ fn flush_sizes(sim: &mut Sim, node: usize) -> Vec<usize> {
 fn b3_per_message_overhead_in_merged_packet() {
     let (mut sim, peer, _) = connected_pair(17, Link::default());
     flush_sizes(&mut sim, 1);
-    // 20 messages of 40 bytes on one channel: header (<= 7) + block (2) + 19 length bytes.
+    // 20 messages of 40 bytes on one channel: header (<= 8) + block (2) + 19 length bytes.
     for _ in 0..20 {
         sim.manager(1).send(peer, 0, &[7; 40]).unwrap();
     }
     let sizes = flush_sizes(&mut sim, 1);
     assert_eq!(sizes.len(), 1);
     let overhead = sizes[0] - 800;
-    assert!(overhead <= 7 + 2 + 19, "overhead {overhead}");
+    assert!(overhead <= 8 + 2 + 19, "overhead {overhead}");
     // 1 byte of length up to 127 bytes, 2 bytes from 128.
     for (len, per_msg) in [(127usize, 1usize), (128, 2)] {
         for _ in 0..5 {
@@ -462,10 +502,30 @@ fn b3_per_message_overhead_in_merged_packet() {
         let sizes = flush_sizes(&mut sim, 1);
         assert_eq!(sizes.len(), 1);
         let overhead = sizes[0] - 5 * len;
-        assert!(overhead <= 7 + 1 + 4 * per_msg, "len {len}: overhead {overhead}");
+        assert!(overhead <= 8 + 1 + 4 * per_msg, "len {len}: overhead {overhead}");
     }
     // A lone message pays no length prefix: header + block byte only.
     sim.manager(1).send(peer, 1, &[1; 48]).unwrap();
     let sizes = flush_sizes(&mut sim, 1);
-    assert!(sizes[0] - 48 <= 7 + 1, "lone message overhead {}", sizes[0] - 48);
+    assert!(sizes[0] - 48 <= 8 + 1, "lone message overhead {}", sizes[0] - 48);
+}
+
+#[test]
+fn s1_ping_replies_are_rate_limited() {
+    let (mut sim, peer, log) = connected_pair(19, Link::default());
+    let speer = server_peer(&log);
+    let before = sim.nodes[0].manager.peer_stats(speer).unwrap().ping_acks_sent;
+    // A flood of PING-flagged packets "from the client" with fresh sequence numbers.
+    let (from, to) = (sim.addr(1), sim.addr(0));
+    for i in 0..1000u16 {
+        let seq = 30_000u16.wrapping_add(i);
+        let mut p = vec![0x20];
+        p.extend_from_slice(&seq.to_le_bytes());
+        sim.inject(1, from, to, p);
+        sim.advance(Duration::from_millis(1));
+    }
+    let after = sim.nodes[0].manager.peer_stats(speer).unwrap().ping_acks_sent;
+    // One immediate reply per ping_interval / 4 (250 ms) at most: 1 s of flood -> <= 5.
+    assert!(after - before <= 5, "{} immediate replies", after - before);
+    let _ = peer;
 }

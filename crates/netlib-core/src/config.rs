@@ -70,6 +70,9 @@ pub struct Config {
     pub min_rto: Duration,
     /// Upper bound of the retransmission timeout.
     pub max_rto: Duration,
+    /// Largest ack delay reported by the remote side that is subtracted from RTT samples.
+    /// Larger reports are capped, which limits how much a peer can lower its measured RTT.
+    pub max_ack_delay: Duration,
     /// Maximum size of application data in connect, reject and disconnect packets.
     pub max_connect_data: usize,
 }
@@ -89,6 +92,7 @@ impl Default for Config {
             timeout: Duration::from_secs(10),
             min_rto: Duration::from_millis(30),
             max_rto: Duration::from_secs(2),
+            max_ack_delay: Duration::from_millis(100),
             max_connect_data: 256,
         }
     }
@@ -148,6 +152,7 @@ impl Config {
             || self.timeout <= self.ping_interval
             || self.cookie_lifetime < Duration::from_secs(1)
             || self.min_rto > self.max_rto
+            || self.max_ack_delay > crate::wire::MAX_WIRE_ACK_DELAY
         {
             return Err(ConfigError::Timing);
         }
