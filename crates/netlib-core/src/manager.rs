@@ -2855,4 +2855,225 @@ mod tests {
         }
         assert_eq!(sizes, [1, 1, 1, 1, 1, mtu - 4]);
     }
+
+    fn pair(channels: &[DeliveryMode], tweak: impl Fn(&mut Config)) -> (Manager, Manager, PeerId, PeerId, Time) {
+        let mut t = Time::from_millis(1);
+        let mut config = Config {
+            channels: channels.iter().map(|&m| ChannelConfig::new(m)).collect(),
+            ..Config::default()
+        };
+        tweak(&mut config);
+        let mut s = Manager::new(
+            Config {
+                accept_incoming: true,
+                ..config.clone()
+            },
+            [1; 32],
+            t,
+        )
+        .unwrap();
+        let mut c = Manager::new(config, [2; 32], t).unwrap();
+        let id = c.connect(t, S, &[]).unwrap();
+        exchange(&mut s, &mut c, C, &mut t, 5);
+        assert_eq!(c.peer_state(id), Some(PeerState::Connected));
+        let sp = s.peers().next().unwrap();
+        (s, c, id, sp, t)
+    }
+
+    fn with_seq(pkt: &[u8], seq: u16) -> Vec<u8> {
+        let mut p = pkt.to_vec();
+        p[1..3].copy_from_slice(&seq.to_le_bytes());
+        p
+    }
+
+    fn seq_of(pkt: &[u8]) -> u16 {
+        u16::from_le_bytes([pkt[1], pkt[2]])
+    }
+
+    #[test]
+    fn peer_stats_count_every_kind_of_packet_and_message() {
+        use DeliveryMode::*;
+        let (mut s, mut c, id, sp, t) = pair(&[Unreliable, ReliableOrdered, UnreliableSequenced], |_| {});
+        let base = s.peer_stats(sp).unwrap().clone();
+        let mut want = base.clone();
+        let check = |s: &Manager, want: &PeerStats| assert_eq!(s.peer_stats(sp).unwrap(), want);
+        let packet = |c: &mut Manager, ch: u8, msgs: &[&[u8]]| {
+            for m in msgs {
+                c.send(id, ch, m).unwrap();
+            }
+            c.flush(t);
+            let mut p = drain(c);
+            assert_eq!(p.len(), 1);
+            p.pop().unwrap()
+        };
+        let d0 = s.stats().datagrams_dropped;
+
+        let p1 = packet(&mut c, 0, &[b"a", b"b", b"c"]);
+        s.handle_datagram(t, C, &p1);
+        want.packets_received += 1;
+        want.bytes_received += p1.len() as u64;
+        want.messages_received += 3;
+        check(&s, &want);
+        s.handle_datagram(t, C, &p1);
+        want.packets_duplicate += 1;
+        check(&s, &want);
+        s.handle_datagram(t, C, &with_seq(&p1, seq_of(&p1).wrapping_sub(1000)));
+        want.packets_duplicate += 1;
+        check(&s, &want);
+
+        s.handle_datagram(t, C, &[0x80, 0, 0]);
+        want.packets_malformed += 1;
+        check(&s, &want);
+        let p2 = packet(&mut c, 0, &[b"d"]);
+        let mut bad = vec![TYPE_DATA];
+        bad.extend_from_slice(&p2[1..3]);
+        bad.extend_from_slice(&[0x2f, 0]);
+        s.handle_datagram(t, C, &bad);
+        want.packets_malformed += 1;
+        check(&s, &want);
+        s.handle_datagram(t, C, &p2);
+        want.packets_received += 1;
+        want.bytes_received += p2.len() as u64;
+        want.messages_received += 1;
+        check(&s, &want);
+
+        // Sequenced: the older packet's message is stale.
+        let p4 = packet(&mut c, 2, &[b"old"]);
+        let p5 = packet(&mut c, 2, &[b"new"]);
+        s.handle_datagram(t, C, &p5);
+        s.handle_datagram(t, C, &p4);
+        want.packets_received += 2;
+        want.bytes_received += (p4.len() + p5.len()) as u64;
+        want.messages_received += 1;
+        want.messages_stale += 1;
+        check(&s, &want);
+        // The same reliable message in two packets: delivered once.
+        let p3 = packet(&mut c, 1, &[b"r"]);
+        s.handle_datagram(t, C, &p3);
+        s.handle_datagram(t, C, &with_seq(&p3, seq_of(&p3).wrapping_add(50)));
+        want.packets_received += 2;
+        want.bytes_received += 2 * p3.len() as u64;
+        want.messages_received += 1;
+        want.messages_duplicate += 1;
+        check(&s, &want);
+
+        // Packet-level drops are peer statistics, not manager drops.
+        assert_eq!(s.stats().datagrams_dropped, d0);
+    }
+
+    fn types(pkts: &[Vec<u8>]) -> Vec<u8> {
+        pkts.iter().map(|p| p[0] & 0x0f).collect()
+    }
+
+    #[test]
+    fn handshake_retries_follow_the_retry_timer() {
+        let t = Time::from_millis(1);
+        let retry = Config::default().connect_retry;
+        let half = retry / 2;
+        let (mut s, mut c) = (server(), client());
+        c.connect(t, S, &[]).unwrap();
+        c.flush(t);
+        let req = drain(&mut c);
+        assert_eq!(types(&req), [1]);
+        c.update(t + half);
+        assert!(drain(&mut c).is_empty(), "retry before its time");
+        c.update(t + retry);
+        assert_eq!(types(&drain(&mut c)), [1]);
+        c.update(t + retry + half);
+        assert!(drain(&mut c).is_empty());
+        // Challenged: the response is retried on the same timer.
+        let t = t + retry + half;
+        s.handle_datagram(t, C, &req[0]);
+        deliver(&mut c, t, S, &drain(&mut s));
+        assert_eq!(types(&drain(&mut c)), [3]);
+        c.update(t + half);
+        assert!(drain(&mut c).is_empty(), "retry before its time");
+        c.update(t + retry);
+        assert_eq!(types(&drain(&mut c)), [3]);
+    }
+
+    /// Moves the client of a fresh pair to C2 without delivering anything to it, so the
+    /// server's path challenges go unanswered.
+    fn unvalidated_move(min_rto: Duration) -> (Manager, PeerId, Time) {
+        let (mut s, mut c, id, sp, mut t) = pair(&[DeliveryMode::Unreliable], |cfg| cfg.min_rto = min_rto);
+        c.local_address_changed();
+        c.send(id, 0, b"x").unwrap();
+        t = t + Duration::from_millis(10);
+        c.flush(t);
+        let moved = drain(&mut c);
+        deliver(&mut s, t, C2, &moved);
+        assert_eq!(s.peer_addr(sp), Some(C2));
+        assert_eq!(s.peer_stats(sp).unwrap().migrations, 1);
+        let challenges = drain(&mut s);
+        assert!(types(&challenges).contains(&8), "PATH_CHALLENGE");
+        (s, sp, t)
+    }
+
+    #[test]
+    fn unvalidated_path_reverts_after_three_rto() {
+        let rto = Duration::from_millis(1000);
+        let (mut s, sp, t) = unvalidated_move(rto);
+        let rto = s.peer_rto(sp).unwrap();
+        assert!(rto >= Duration::from_millis(1000));
+        // Re-challenged once per RTO, never in between.
+        s.update(t + rto / 2);
+        assert!(drain(&mut s).iter().all(|p| p[0] & 0x0f != 8));
+        s.update(t + rto);
+        assert!(types(&drain(&mut s)).contains(&8));
+        s.update(t + rto * 2 + rto / 2);
+        drain(&mut s);
+        assert_eq!(s.stats().failed_path_validations, 0, "deadline is 3 RTO, not 1 s");
+        assert_eq!(s.peer_addr(sp), Some(C2));
+        s.update(t + rto * 3);
+        drain(&mut s);
+        assert_eq!(s.stats().failed_path_validations, 1);
+        assert_eq!(s.peer_addr(sp), Some(C));
+        assert!(!s.by_addr.contains_key(&C2));
+        s.update(t + rto * 4);
+        let late = drain(&mut s);
+        assert!(
+            late.iter().all(|p| p[0] & 0x0f != 8),
+            "no challenges after the deadline: {late:?}"
+        );
+    }
+
+    #[test]
+    fn second_authenticated_packet_validates_the_path() {
+        let (mut s, mut c, id, sp, mut t) = pair(&[DeliveryMode::Unreliable], |_| {});
+        c.local_address_changed();
+        for _ in 0..2 {
+            c.send(id, 0, b"x").unwrap();
+            t = t + Duration::from_millis(10);
+            c.flush(t);
+            deliver(&mut s, t, C2, &drain(&mut c));
+        }
+        // Validated without any PATH_RESPONSE: the old address is forgotten.
+        assert_eq!(s.peer_addr(sp), Some(C2));
+        assert!(!s.by_addr.contains_key(&C));
+        s.update(t + Duration::from_secs(5));
+        assert_eq!(s.stats().failed_path_validations, 0);
+    }
+
+    #[test]
+    fn moving_again_before_validation_forgets_the_middle_address() {
+        let (mut s, mut c, id, sp, mut t) = pair(&[DeliveryMode::Unreliable], |_| {});
+        c.local_address_changed();
+        c.send(id, 0, b"x").unwrap();
+        t = t + Duration::from_millis(10);
+        c.flush(t);
+        let first = drain(&mut c);
+        deliver(&mut s, t, C2, &first);
+        // The next authenticated packet arrives from yet another address.
+        c.send(id, 0, b"y").unwrap();
+        c.flush(t);
+        let c3 = SocketAddr::new(C.ip(), 5002);
+        let moved = drain(&mut c);
+        deliver(&mut s, t, c3, &moved[..1]);
+        assert_eq!(s.peer_addr(sp), Some(c3));
+        assert!(!s.by_addr.contains_key(&C2));
+        assert_eq!(s.stats().migrations, 2);
+        // Failing validation (deadline: 3 RTO, at least 1 s) goes back to the original address.
+        s.update(t + Duration::from_secs(5));
+        assert_eq!(s.peer_addr(sp), Some(C));
+    }
 }
