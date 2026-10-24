@@ -2799,7 +2799,7 @@ mod tests {
             "only the packet answered by WHO_ARE_YOU: {dropped_by_server}"
         );
         assert_eq!(s.stats().who_are_you_sent, dropped_by_server);
-        assert!(s.by_addr.get(&C).is_none());
+        assert!(!s.by_addr.contains_key(&C));
         // Disconnect frees every index.
         s.disconnect(server_peer, &[]).unwrap();
         assert!(s.by_conn.is_empty());
