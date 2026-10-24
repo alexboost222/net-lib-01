@@ -12,6 +12,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod channel;
 mod config;
 mod event;
 mod manager;

@@ -75,6 +75,10 @@ pub struct Config {
     pub max_ack_delay: Duration,
     /// Maximum size of application data in connect, reject and disconnect packets.
     pub max_connect_data: usize,
+    /// Largest message on a reliable channel; larger than one packet means fragmentation.
+    pub max_reliable_message: usize,
+    /// Reliable messages per channel waiting for an ack before `send` fails with `QueueFull`.
+    pub max_reliable_queue: usize,
 }
 
 impl Default for Config {
@@ -94,6 +98,8 @@ impl Default for Config {
             max_rto: Duration::from_secs(2),
             max_ack_delay: Duration::from_millis(100),
             max_connect_data: 256,
+            max_reliable_message: 64 * 1024,
+            max_reliable_queue: 4096,
         }
     }
 }
@@ -112,12 +118,12 @@ pub enum ConfigError {
     Mtu,
     /// No channels or more than `MAX_CHANNELS`.
     ChannelCount,
-    /// The delivery mode is not implemented yet.
-    UnsupportedMode(DeliveryMode),
     /// A timing parameter is zero or inconsistent.
     Timing,
     /// `max_connect_data` does not fit into a minimal-MTU packet.
     ConnectData,
+    /// `max_reliable_message` needs too many fragments or `max_reliable_queue` is zero.
+    ReliableLimits,
 }
 
 impl core::fmt::Display for ConfigError {
@@ -125,9 +131,9 @@ impl core::fmt::Display for ConfigError {
         match self {
             ConfigError::Mtu => write!(f, "mtu must be in {MIN_MTU}..={MAX_MTU}"),
             ConfigError::ChannelCount => write!(f, "between 1 and {MAX_CHANNELS} channels required"),
-            ConfigError::UnsupportedMode(m) => write!(f, "delivery mode {m:?} is not supported yet"),
             ConfigError::Timing => write!(f, "invalid timing parameters"),
             ConfigError::ConnectData => write!(f, "max_connect_data is too large"),
+            ConfigError::ReliableLimits => write!(f, "invalid reliable message limits"),
         }
     }
 }
@@ -141,9 +147,6 @@ impl Config {
         }
         if self.channels.is_empty() || self.channels.len() > MAX_CHANNELS {
             return Err(ConfigError::ChannelCount);
-        }
-        if let Some(c) = self.channels.iter().find(|c| c.mode.is_reliable()) {
-            return Err(ConfigError::UnsupportedMode(c.mode));
         }
         let zero = Duration::ZERO;
         if self.connect_retry == zero
@@ -160,13 +163,32 @@ impl Config {
         if 1 + 8 + 4 + 8 + 3 + self.max_connect_data > MIN_MTU {
             return Err(ConfigError::ConnectData);
         }
+        if self.max_reliable_message.div_ceil(self.fragment_size()) > crate::channel::MAX_FRAGMENTS
+            || self.max_reliable_queue == 0
+        {
+            return Err(ConfigError::ReliableLimits);
+        }
         Ok(())
     }
 
     /// Largest message accepted by `send` on a channel with the given mode.
     pub fn max_message_size(&self, mode: DeliveryMode) -> usize {
-        // A message alone in a packet sits in a tail block without a length prefix.
-        let _ = mode;
-        self.mtu - crate::wire::DATA_HEADER_MAX - 1
+        if mode.is_reliable() {
+            self.max_reliable_message
+        } else {
+            // A message alone in a packet sits in a tail block without a length prefix.
+            self.mtu - crate::wire::DATA_HEADER_MAX - 1
+        }
+    }
+
+    /// Largest reliable message sent without fragmentation: it fits an empty packet with
+    /// header, block header, base seq, a 3-byte length and a 1-byte tag.
+    pub(crate) fn single_reliable_limit(&self) -> usize {
+        self.mtu - crate::wire::DATA_HEADER_MAX - 1 - 2 - 3 - 1
+    }
+
+    /// Payload of one fragment: as above plus 2-byte fragment count and index.
+    pub(crate) fn fragment_size(&self) -> usize {
+        self.single_reliable_limit() - 4
     }
 }

@@ -13,8 +13,9 @@ UDP-транспорт на Rust для fast-paced мультиплеера (FPS
 
 ## Статус
 
-**M1**: handshake с stateless cookie, keepalive, таймауты, disconnect, режимы `Unreliable` и `UnreliableSequenced`, эмулятор сети, std-драйвер.
-Reliable-режимы появятся в M2.
+**M2**: все пять режимов доставки (`Unreliable`, `UnreliableSequenced`, `ReliableUnordered`, `ReliableOrdered`, `ReliableSequenced`).
+Повторная отправка по порогу пакетов и по RTO с backoff, фрагментация до 64 КиБ, сетевой RTT без задержки подтверждения (`ack_delay`, защита как в QUIC).
+Упаковка с приоритетами появится в M3.
 
 ## Структура
 
