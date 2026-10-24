@@ -7,8 +7,10 @@ yanked = "deny"
 
 [licenses]
 version = 2
-allow = ["MIT", "Apache-2.0"]
+allow = ["MIT", "Apache-2.0", "Unicode-3.0"]
 confidence-threshold = 0.9
+# cbindgen is a build tool of xtask (C header generation); it is not linked into the library.
+exceptions = [{ crate = "cbindgen", allow = ["MPL-2.0"] }]
 
 [bans]
 multiple-versions = "warn"

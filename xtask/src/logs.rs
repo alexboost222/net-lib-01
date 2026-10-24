@@ -313,7 +313,10 @@ mod tests {
         let entries = catalog(&root());
         assert!(entries.len() >= 30, "found {} events", entries.len());
         assert_eq!(lint(&entries), Vec::<String>::new());
-        let doc = std::fs::read_to_string(root().join("docs/LOG_EVENTS.md")).unwrap_or_default();
+        // Git may check the file out with CRLF line endings on Windows.
+        let doc = std::fs::read_to_string(root().join("docs/LOG_EVENTS.md"))
+            .unwrap_or_default()
+            .replace("\r\n", "\n");
         assert!(
             doc == catalog_markdown(&entries),
             "docs/LOG_EVENTS.md is out of date: run `cargo xtask log-catalog`"

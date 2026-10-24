@@ -1,0 +1,3 @@
+# Generated files are compared byte for byte in CI.
+bindings/c/netlib.h text eol=lf
+docs/LOG_EVENTS.md text eol=lf
