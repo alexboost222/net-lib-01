@@ -18,6 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         receive_thread: !no_thread,
     };
     let mut m = Manager::bind_with("0.0.0.0:0", common::config(false), driver)?;
+    common::logging(&mut m);
     let peer = m.connect(&server, b"echo")??;
     println!("connecting to {server} from {}", m.local_addr()?);
 

@@ -15,6 +15,8 @@ UDP-транспорт на Rust для fast-paced мультиплеера (FPS
 
 **M2**: все пять режимов доставки (`Unreliable`, `UnreliableSequenced`, `ReliableUnordered`, `ReliableOrdered`, `ReliableSequenced`).
 Повторная отправка по порогу пакетов и по RTO с backoff, фрагментация до 64 КиБ, сетевой RTT без задержки подтверждения (`ack_delay`, защита как в QUIC).
+**M6**: структурированное логирование — макрос `netlog!` с проверкой шаблонов при компиляции, CLEF, ограничение частоты, проброс в C#, `logview`.
+
 **M5**: C ABI (`crates/netlib-ffi`, заголовок `bindings/c/netlib.h`) и .NET-биндинг (`bindings/dotnet`, .NET Standard 2.1, ноль GC-аллокаций).
 
 **M4**: миграция соединения при смене адреса и пересоздании сокета без дисконнекта.
@@ -68,6 +70,16 @@ loop {
     server.flush();                       // конец тика: упаковка и отправка
 }
 ```
+
+## Логирование
+
+События пишутся по [Message Templates](https://messagetemplates.org/): у каждого константный шаблон, стабильный `EventId` и типизированные свойства (`PeerId`, `RemoteEndpoint`, `Seq`…).
+
+- **Каталог событий:** [docs/LOG_EVENTS.md](docs/LOG_EVENTS.md).
+- **Rust:** `manager.set_log_sink(Some(Box::new(netlib::logging::ClefSink::new(...))))` или свой `LogSink`.
+- **C#:** `net.SetLogLevel(LogLevel.Info)`, затем после каждого `Poll()` цикл `while (net.TryGetLog(out var r)) ...`. Доступны `r.Template`, `r.EventId`, `r.GetProperty(i)`, `r.Render()`.
+- **Примеры:** `NETLIB_LOG=debug cargo run -p netlib --example echo_server`. Для вывода в CLEF (Seq, Serilog, `jq`) добавьте `NETLIB_LOG_FORMAT=clef`.
+- **Разбор:** `cargo xtask logview FILE --summary | --peer ID | --event ID | --min-level Warning`.
 
 ## Лицензия
 

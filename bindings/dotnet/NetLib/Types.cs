@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.Net;
+using System.Text;
 using System.Runtime.InteropServices;
 
 namespace NetLib
@@ -288,6 +290,173 @@ namespace NetLib
             Reason = Kind == NetEventKind.Disconnected ? (DisconnectReason)e.Reason : DisconnectReason.None;
             Data = e.Data == null ? ReadOnlySpan<byte>.Empty : new ReadOnlySpan<byte>(e.Data, (int)e.DataLen);
             Address = e.Addr;
+        }
+    }
+}
+
+namespace NetLib
+{
+    /// <summary>Severity of a log record.</summary>
+    public enum LogLevel
+    {
+        /// <summary>Logging disabled.</summary>
+        Off = -1,
+        /// <summary>Per-datagram detail.</summary>
+        Trace = 0,
+        /// <summary>Drops, retransmissions, scheduler decisions.</summary>
+        Debug = 1,
+        /// <summary>Connection lifecycle and periodic statistics.</summary>
+        Info = 2,
+        /// <summary>Problems the connection survives or that have external causes.</summary>
+        Warn = 3,
+        /// <summary>Failures.</summary>
+        Error = 4,
+    }
+
+    /// <summary>Type of a <see cref="LogProperty"/> value.</summary>
+    public enum LogValueKind : byte
+    {
+        /// <summary><see cref="LogProperty.UInt64"/>.</summary>
+        UInt64 = 0,
+        /// <summary><see cref="LogProperty.Int64"/>.</summary>
+        Int64 = 1,
+        /// <summary><see cref="LogProperty.Double"/>; durations are milliseconds.</summary>
+        Double = 2,
+        /// <summary><see cref="LogProperty.Bool"/>.</summary>
+        Bool = 3,
+        /// <summary><see cref="LogProperty.Utf8"/>: text and addresses.</summary>
+        String = 4,
+    }
+
+    /// <summary>A named, typed property of a log record. Valid while its record is.</summary>
+    public readonly unsafe ref struct LogProperty
+    {
+        /// <summary>PascalCase name as UTF-8.</summary>
+        public readonly ReadOnlySpan<byte> NameUtf8;
+        /// <summary>Type of the value.</summary>
+        public readonly LogValueKind Kind;
+        /// <summary>Value for <see cref="LogValueKind.UInt64"/>.</summary>
+        public readonly ulong UInt64;
+        /// <summary>Value for <see cref="LogValueKind.Int64"/>.</summary>
+        public readonly long Int64;
+        /// <summary>Value for <see cref="LogValueKind.Double"/>.</summary>
+        public readonly double Double;
+        /// <summary>Value for <see cref="LogValueKind.String"/> as UTF-8.</summary>
+        public readonly ReadOnlySpan<byte> Utf8;
+
+        internal LogProperty(in Native.LogProperty p)
+        {
+            NameUtf8 = new ReadOnlySpan<byte>(p.Name, (int)p.NameLen);
+            Kind = (LogValueKind)p.Kind;
+            UInt64 = p.U;
+            Int64 = p.I;
+            Double = p.F;
+            Utf8 = p.Str == null ? ReadOnlySpan<byte>.Empty : new ReadOnlySpan<byte>(p.Str, (int)p.StrLen);
+        }
+
+        /// <summary>Value for <see cref="LogValueKind.Bool"/>.</summary>
+        public bool Bool => UInt64 != 0;
+
+        /// <summary>The name (allocates).</summary>
+        public string Name => Encoding.UTF8.GetString(NameUtf8);
+
+        /// <summary>The value as text (allocates).</summary>
+        public override string ToString() => Kind switch
+        {
+            LogValueKind.UInt64 => UInt64.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            LogValueKind.Int64 => Int64.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            LogValueKind.Double => Double.ToString("R", System.Globalization.CultureInfo.InvariantCulture),
+            LogValueKind.Bool => Bool ? "true" : "false",
+            _ => Encoding.UTF8.GetString(Utf8),
+        };
+    }
+
+    /// <summary>
+    /// A structured log record: a message template (https://messagetemplates.org/), a stable
+    /// event id and typed properties in template order. Nothing is formatted on the native side.
+    /// </summary>
+    public readonly unsafe ref struct LogRecord
+    {
+        private static readonly Dictionary<uint, string> Templates = new Dictionary<uint, string>();
+        private readonly Native.LogProperty* _props;
+
+        /// <summary>Severity.</summary>
+        public readonly LogLevel Level;
+        /// <summary>Stable id of the template (docs/LOG_EVENTS.md).</summary>
+        public readonly uint EventId;
+        /// <summary>Microseconds since the manager was created.</summary>
+        public readonly ulong TimeMicros;
+        /// <summary>The template as UTF-8.</summary>
+        public readonly ReadOnlySpan<byte> TemplateUtf8;
+        /// <summary>Number of properties.</summary>
+        public readonly int PropertyCount;
+
+        internal LogRecord(in Native.LogRecord r)
+        {
+            Level = (LogLevel)r.Level;
+            EventId = r.EventId;
+            TimeMicros = r.TimeUs;
+            TemplateUtf8 = new ReadOnlySpan<byte>(r.Template, (int)r.TemplateLen);
+            PropertyCount = (int)r.PropertyCount;
+            _props = r.Properties;
+        }
+
+        /// <summary>Property <paramref name="index"/> in template order.</summary>
+        public LogProperty GetProperty(int index)
+        {
+            if ((uint)index >= (uint)PropertyCount) throw new ArgumentOutOfRangeException(nameof(index));
+            return new LogProperty(_props[index]);
+        }
+
+        /// <summary>The template text; cached per event id, so it allocates once per event type.</summary>
+        public string Template
+        {
+            get
+            {
+                lock (Templates)
+                {
+                    if (!Templates.TryGetValue(EventId, out var t))
+                    {
+                        t = Encoding.UTF8.GetString(TemplateUtf8);
+                        Templates[EventId] = t;
+                    }
+                    return t;
+                }
+            }
+        }
+
+        /// <summary>The template with values in place of its holes (allocates).</summary>
+        public string Render()
+        {
+            var t = Template;
+            var sb = new StringBuilder(t.Length + 32);
+            var hole = 0;
+            for (var i = 0; i < t.Length; i++)
+            {
+                var c = t[i];
+                if ((c == '{' || c == '}') && i + 1 < t.Length && t[i + 1] == c)
+                {
+                    sb.Append(c);
+                    i++;
+                    continue;
+                }
+                if (c != '{')
+                {
+                    sb.Append(c);
+                    continue;
+                }
+                var close = t.IndexOf('}', i);
+                if (close < 0)
+                {
+                    sb.Append(t, i, t.Length - i);
+                    break;
+                }
+                if (hole < PropertyCount) sb.Append(GetProperty(hole).ToString());
+                else sb.Append(t, i, close - i + 1);
+                hole++;
+                i = close;
+            }
+            return sb.ToString();
         }
     }
 }

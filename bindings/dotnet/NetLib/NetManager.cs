@@ -150,6 +150,26 @@ namespace NetLib
             fixed (PeerStats* s = &stats) return Native.PeerStats(Handle, peer.Value, s) == 0;
         }
 
+        /// <summary>
+        /// Enables structured log records from <paramref name="level"/> up, or disables them with
+        /// <see cref="LogLevel.Off"/>. Records are collected by <see cref="Poll"/> and read with
+        /// <see cref="TryGetLog"/>.
+        /// </summary>
+        public void SetLogLevel(LogLevel level) => NetException.Check(Native.SetLogLevel(Handle, (int)level));
+
+        /// <summary>
+        /// Takes the next log record collected by <see cref="Poll"/>. The record is valid until the
+        /// next call or <see cref="Poll"/>.
+        /// </summary>
+        public bool TryGetLog(out LogRecord record)
+        {
+            Native.LogRecord r;
+            var n = Native.NextLog(Handle, &r);
+            NetException.Check(n);
+            record = n == 1 ? new LogRecord(r) : default;
+            return n == 1;
+        }
+
         /// <summary>Recreates the socket, e.g. after returning from background; connections continue.</summary>
         public void Rebind() => NetException.Check(Native.Rebind(Handle));
 

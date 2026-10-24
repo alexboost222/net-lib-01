@@ -327,7 +327,7 @@ mod tests {
     }
 
     #[test]
-    fn l5_clef_from_a_real_scenario_parses_and_renders() {
+    fn l5_l7_clef_from_a_real_scenario_parses_renders_and_views() {
         use netlib_core::log::{Level, write_clef};
         use netlib_core::{ChannelConfig, Config, DeliveryMode, Event};
         use netlib_sim::{Link, LogCapture, Sim};

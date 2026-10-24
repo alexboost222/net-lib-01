@@ -1,6 +1,9 @@
 //! Runs a server with N clients on the emulated network and prints what happened.
 //!
 //! cargo run -p netlib-sim --example sim -- --loss 10 --latency 100 --jitter 20 --clients 8 --seconds 20
+//! cargo run -p netlib-sim --example sim -- --loss 30 --clef sim.clef && cargo xtask logview sim.clef --summary
+//!
+//! `--clef FILE` writes Debug and higher events of all nodes as CLEF.
 //!
 //! Every client sends a 48-byte state on the sequenced channel and an 8-byte event on the
 //! unreliable channel each tick and a 24-byte reliable ordered event every 8th tick; the server
@@ -8,7 +11,28 @@
 
 use std::time::Duration;
 
+use std::io::Write;
+use std::sync::{Arc, Mutex};
+
+use netlib_core::log::{Level, LogSink, Record, write_clef};
 use netlib_core::{ChannelConfig, Config, DeliveryMode, Event, PeerState};
+
+/// Writes CLEF lines of one node to a shared file, tagging them with the node index.
+struct Clef(Arc<Mutex<std::fs::File>>, usize);
+
+impl LogSink for Clef {
+    fn enabled(&self, level: Level) -> bool {
+        level >= Level::Debug
+    }
+    fn log(&mut self, r: &Record<'_>) {
+        let mut line = String::new();
+        // Virtual time starts at the Unix epoch + 1 s.
+        if write_clef(&mut line, r.time_us, r).is_ok() {
+            line.pop();
+            let _ = writeln!(self.0.lock().unwrap(), "{line},\"Node\":{}}}", self.1);
+        }
+    }
+}
 use netlib_sim::{Link, Sim};
 
 const TICK: Duration = Duration::from_micros(15_625); // 64 Hz
@@ -44,6 +68,10 @@ fn main() {
         ],
         ..Config::default()
     };
+    let clef = args
+        .windows(2)
+        .find(|w| w[0] == "--clef")
+        .map(|w| Arc::new(Mutex::new(std::fs::File::create(&w[1]).expect("create the CLEF file"))));
     let mut sim = Sim::new(seed, link);
     let server = sim.add_node(config.clone()).unwrap();
     let addr = sim.addr(server);
@@ -56,6 +84,11 @@ fn main() {
             .unwrap();
         let now = sim.now;
         sim.manager(c).connect(now, addr, b"sim").unwrap();
+    }
+    if let Some(file) = &clef {
+        for i in 0..sim.nodes.len() {
+            sim.manager(i).set_log_sink(Some(Box::new(Clef(file.clone(), i))));
+        }
     }
     sim.transmit();
 

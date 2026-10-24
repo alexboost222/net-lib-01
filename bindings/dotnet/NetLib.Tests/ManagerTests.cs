@@ -180,3 +180,47 @@ public class ManagerTests
         Assert.Equal(0, allocated);
     }
 }
+
+public class LogTests
+{
+    [Fact]
+    public void L_StructuredLogsReachCSharp()
+    {
+        var channels = new[] { new ChannelConfig(DeliveryMode.ReliableOrdered) };
+        using var server = new NetManager(new NetConfig { ProtocolId = 5, AcceptIncoming = true, Channels = channels }, "127.0.0.1:0");
+        using var client = new NetManager(new NetConfig { ProtocolId = 5, Channels = channels }, "127.0.0.1:0");
+        server.SetLogLevel(LogLevel.Debug);
+        var peer = client.Connect($"127.0.0.1:{server.LocalAddress.Port}");
+        var rendered = new List<string>();
+        var connectedEvent = 0u;
+        for (var i = 0; i < 200 && connectedEvent == 0; i++)
+        {
+            server.Poll();
+            while (server.TryGetEvent(out var e)) if (e.Kind == NetEventKind.ConnectRequest) server.Accept(e.Peer);
+            while (server.TryGetLog(out var r))
+            {
+                rendered.Add(r.Render());
+                if (r.Template == "Peer {PeerId} connected from {RemoteEndpoint} as connection {ConnId}")
+                {
+                    Assert.Equal(LogLevel.Info, r.Level);
+                    Assert.Equal(3, r.PropertyCount);
+                    Assert.Equal("PeerId", r.GetProperty(0).Name);
+                    Assert.Equal(LogValueKind.UInt64, r.GetProperty(0).Kind);
+                    Assert.Equal(LogValueKind.String, r.GetProperty(1).Kind);
+                    Assert.StartsWith("127.0.0.1:", r.GetProperty(1).ToString());
+                    connectedEvent = r.EventId;
+                }
+            }
+            server.Flush();
+            client.Poll();
+            while (client.TryGetEvent(out _)) { }
+            client.Flush();
+            Thread.Sleep(2);
+        }
+        Assert.NotEqual(0u, connectedEvent);
+        Assert.Contains(rendered, l => l.StartsWith("Peer 0 connected from 127.0.0.1:"));
+        server.SetLogLevel(LogLevel.Off);
+        server.Poll();
+        Assert.False(server.TryGetLog(out _));
+    }
+}

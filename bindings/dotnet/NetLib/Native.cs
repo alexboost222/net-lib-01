@@ -64,6 +64,37 @@ namespace NetLib
             public NetAddress Addr;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct LogProperty
+        {
+            public byte* Name;
+            public uint NameLen;
+            public byte Kind;
+            public ulong U;
+            public long I;
+            public double F;
+            public byte* Str;
+            public uint StrLen;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct LogRecord
+        {
+            public byte Level;
+            public uint EventId;
+            public ulong TimeUs;
+            public byte* Template;
+            public uint TemplateLen;
+            public LogProperty* Properties;
+            public uint PropertyCount;
+        }
+
+        [DllImport(Lib, EntryPoint = "netlib_set_log_level")]
+        internal static extern int SetLogLevel(IntPtr manager, int level);
+
+        [DllImport(Lib, EntryPoint = "netlib_next_log")]
+        internal static extern int NextLog(IntPtr manager, LogRecord* record);
+
         [DllImport(Lib, EntryPoint = "netlib_config_default")]
         internal static extern int ConfigDefault(Config* config);
 

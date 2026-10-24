@@ -18,6 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         receive_thread: !no_thread,
     };
     let mut m = Manager::bind_with(&bind, common::config(true), driver)?;
+    common::logging(&mut m);
     println!("echo server on {}", m.local_addr()?);
     let mut echo = Vec::new();
     let mut next = Instant::now();
