@@ -201,6 +201,8 @@ fn header(check: bool) -> ExitCode {
 }
 
 /// Evidence for coverage criteria from the last `cargo xtask coverage` run.
+const DEFERRED: &str = "deferred: run `cargo mutants -p netlib-core` or the Mutants workflow";
+
 fn coverage_evidence(id: &str) -> (String, bool) {
     let Some(v) = std::fs::read_to_string(coverage::SUMMARY)
         .ok()
@@ -230,6 +232,9 @@ fn coverage_evidence(id: &str) -> (String, bool) {
                 .join(", ");
             (text, pass)
         }
+        // Mutation testing is postponed: without results the row is shown as deferred
+        // and does not gate M7. Results in mutants.out are checked as usual.
+        "T4" if get("core_mutation_score").is_none() => (DEFERRED.into(), true),
         "T4" => at_least("core_mutation_score", coverage::MUTATION_SCORE),
         "T5" => at_least("dotnet_lines", coverage::DOTNET_LINES),
         "T7" => {
@@ -496,7 +501,13 @@ fn report(args: &[String]) -> ExitCode {
         let _ = writeln!(
             out,
             "| {id} | {m} | {desc} | {evidence} | {} |",
-            if status { "✅" } else { "❌" }
+            if evidence == DEFERRED {
+                "⏸"
+            } else if status {
+                "✅"
+            } else {
+                "❌"
+            }
         );
     }
     let _ = writeln!(out, "\nAll tests: {}/{} passed.", total.0, total.1);

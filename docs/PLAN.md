@@ -216,7 +216,7 @@
 | T1 | Line coverage `netlib-core` | ≥ 90 % | `cargo llvm-cov`, гейт в CI |
 | T2 | Branch coverage `netlib-core` (парсер, планировщик, ack, миграция) | ≥ 80 % | `cargo llvm-cov --branch` |
 | T3 | Line coverage остальных Rust-крейтов (драйвер, FFI) | ≥ 75 % | `cargo llvm-cov` |
-| T4 | Качество тестов: доля убитых мутантов в `netlib-core` | ≥ 85 % | `cargo mutants`, nightly CI |
+| T4 | Качество тестов: доля убитых мутантов в `netlib-core` | ≥ 85 % | `cargo mutants`, ручной запуск workflow (отложено) |
 | T5 | Покрытие .NET-биндинга | ≥ 80 % | coverlet + `dotnet test` |
 | T6 | Каждый критерий из раздела 3 привязан хотя бы к одному тесту | 100 % | матрица трассируемости в `xtask report` (тесты помечены ID критерия) |
 | T7 | Покрытие не падает между коммитами больше чем на 0,5 п.п. | — | CI сравнивает с базовой веткой; HTML-отчёт в артефактах |

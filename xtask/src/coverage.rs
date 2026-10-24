@@ -110,6 +110,26 @@ pub fn run(args: &[String]) -> Result<String, String> {
         ok(Command::new(&cargo).args(["llvm-cov", "report", "--html", "--output-dir", "target/coverage-html"]));
     }
     let lines = per_crate("target/cov-lines.json", "lines");
+    // The core by the tests that target it (as for branches): in the workspace run some of
+    // its files are instrumented twice, which counts their lines twice.
+    let core_ok = ok(Command::new(&cargo).args([
+        "llvm-cov",
+        "-p",
+        "netlib-core",
+        "-p",
+        "netlib-sim",
+        "--json",
+        "--summary-only",
+        "--output-path",
+        "target/cov-core-lines.json",
+    ]));
+    let core_lines = if core_ok {
+        per_crate("target/cov-core-lines.json", "lines")
+            .get("netlib-core")
+            .copied()
+    } else {
+        None
+    };
     // Branches of the core need nightly.
     let branches_ok = ok(Command::new("rustup")
         .args(["run", "nightly", "cargo", "llvm-cov"])
@@ -157,7 +177,7 @@ pub fn run(args: &[String]) -> Result<String, String> {
     row(
         "T1 netlib-core lines",
         "core_lines",
-        lines.get("netlib-core").copied().and_then(percent),
+        core_lines.and_then(percent),
         CORE_LINES,
         &mut failures,
     );

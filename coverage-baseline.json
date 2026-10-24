@@ -1,0 +1,9 @@
+{
+  "core_branches": 87.2,
+  "core_lines": 94.8,
+  "dotnet_lines": 93.8,
+  "netlib-ffi_lines": 83.5,
+  "netlib-log_lines": 96.1,
+  "netlib-sim_lines": 97.5,
+  "netlib_lines": 86.6
+}

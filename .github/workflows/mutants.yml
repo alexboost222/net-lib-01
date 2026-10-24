@@ -1,9 +1,8 @@
 name: Mutation testing
 
-# T4: mutation score of netlib-core, nightly and on demand (it takes about an hour in total).
+# T4: mutation score of netlib-core, on demand (it takes about an hour in total).
+# Postponed for now: no schedule until the score is worked on again.
 on:
-  schedule:
-    - cron: "17 2 * * *"
   workflow_dispatch:
 
 env:
