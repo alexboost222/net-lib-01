@@ -66,10 +66,6 @@ impl<'a> Writer<'a> {
         self.pos
     }
 
-    pub(crate) fn remaining(&self) -> usize {
-        self.buf.len() - self.pos
-    }
-
     pub(crate) fn bytes(&mut self, b: &[u8]) -> Result<(), Full> {
         let end = self.pos.checked_add(b.len()).ok_or(Full)?;
         self.buf.get_mut(self.pos..end).ok_or(Full)?.copy_from_slice(b);

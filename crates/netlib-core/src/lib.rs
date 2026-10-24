@@ -22,7 +22,7 @@ mod siphash;
 mod time;
 mod wire;
 
-pub use config::{ChannelConfig, Config, ConfigError, DeliveryMode, MAX_CHANNELS, MAX_MTU, MIN_MTU};
+pub use config::{ChannelConfig, Config, ConfigError, DeliveryMode, MAX_CHANNELS, MAX_MTU, MIN_MTU, SendOptions};
 pub use event::{DisconnectReason, Event, PeerId};
 pub use manager::{ConnectError, Manager, ManagerStats, PeerError, PeerState, PeerStats, SendError};
 pub use time::Time;

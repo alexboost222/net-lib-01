@@ -11,5 +11,9 @@ publish = false
 [dependencies]
 netlib-core.workspace = true
 
-[lints]
-workspace = true
+# Not the workspace lints: tests here need `unsafe` for a counting global allocator.
+[lints.rust]
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

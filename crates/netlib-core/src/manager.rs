@@ -4,13 +4,14 @@ use alloc::vec::Vec;
 use core::net::SocketAddr;
 use core::time::Duration;
 
-use crate::channel::{Channel, Item, ItemInfo, Received as RecvResult, RecvLimits};
-use crate::config::{Config, ConfigError, DeliveryMode, MAX_CHANNELS};
+use crate::channel::{Cand, Channel, CollectStats, Piece, Received as RecvResult, RecvLimits, SendOpts};
+use crate::config::{Config, ConfigError, DeliveryMode, MAX_CHANNELS, SendOptions};
 use crate::event::{DisconnectReason, Event, PeerId};
 use crate::rtt::RttEstimator;
 use crate::seq::{Received, RecvWindow, seq_newer};
 use crate::siphash::{Rng, SipHasher};
 use crate::time::Time;
+use crate::wire::DATA_HEADER_MAX;
 use crate::wire::{
     BlockHeader, Control, DataHeader, FLAG_PING, REJECT_BY_APP, REJECT_SERVER_FULL, REJECT_VERSION_MISMATCH, Reader,
     TYPE_DATA, WIRE_VERSION, Writer, decode_ack_delay, encode_ack_delay, encode_addr, varint_len,
@@ -54,6 +55,8 @@ pub enum SendError {
     TooLarge,
     /// `Config::max_reliable_queue` messages of this channel wait for an ack.
     QueueFull,
+    /// `ttl` or `replace_key` was given for a reliable channel.
+    InvalidOptions,
 }
 
 /// Errors of `accept`, `reject` and `disconnect`.
@@ -112,6 +115,10 @@ pub struct PeerStats {
     pub messages_retransmitted: u64,
     /// Sent packets declared lost (not acked while 3 later packets were).
     pub packets_lost: u64,
+    /// Unreliable messages dropped because their TTL expired before they could be sent.
+    pub messages_expired: u64,
+    /// Unreliable messages replaced by a newer one with the same `replace_key`.
+    pub messages_replaced: u64,
 }
 
 /// Counters that are not tied to a peer.
@@ -133,8 +140,8 @@ struct SentPacket {
     time: Time,
     in_use: bool,
     acked: bool,
-    /// Reliable units carried: `(channel, message seq, fragment index)`.
-    units: Vec<(u8, u16, u16)>,
+    /// Reliable pieces carried: `(channel, message seq, start offset)`.
+    units: Vec<(u8, u16, u32)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -186,8 +193,12 @@ struct Peer {
     rtt: RttEstimator,
     modes: Vec<DeliveryMode>,
     channels: Vec<Channel>,
-    /// Scratch list for `flush`.
-    items: Vec<(u8, Item)>,
+    /// Scratch lists for `flush`.
+    cands: Vec<Cand>,
+    sched: Scheduler,
+    /// Bandwidth budget: available bytes and the time they were last refilled.
+    tokens: i64,
+    last_refill: Time,
     stats: PeerStats,
 }
 
@@ -217,7 +228,12 @@ impl Peer {
             rtt: RttEstimator::new(config.min_rto, config.max_rto),
             modes: config.channels.iter().map(|c| c.mode).collect(),
             channels: config.channels.iter().map(|c| Channel::new(c.mode)).collect(),
-            items: Vec::new(),
+            cands: Vec::new(),
+            sched: Scheduler::default(),
+            tokens: config
+                .bandwidth
+                .map_or(0, |rate| i64::from(rate / 10).max(2 * config.mtu as i64)),
+            last_refill: now,
             stats: PeerStats::default(),
         }
     }
@@ -337,9 +353,9 @@ impl EventQueue {
 /// One message inside a DATA packet.
 struct Msg<'a> {
     channel: u8,
-    /// Message seq and `(count, index)` for fragments; reliable channels only.
+    /// Message seq and `(total, offset)` for fragments; reliable channels only.
     seq: Option<u16>,
-    frag: Option<(u16, u16)>,
+    frag: Option<(u32, u32)>,
     data: &'a [u8],
 }
 
@@ -390,16 +406,21 @@ impl<'a, 'm> MsgIter<'a, 'm> {
             b.prev_seq = s;
             seq = Some(s);
             if tag & 1 == 1 {
-                let count = self.r.varint_usize()?;
-                let index = self.r.varint_usize()?;
-                if !(2..=crate::channel::MAX_FRAGMENTS).contains(&count) || index >= count {
+                let total = u32::try_from(self.r.varint()?).ok()?;
+                let offset = u32::try_from(self.r.varint()?).ok()?;
+                if total as usize > crate::channel::MAX_FRAGMENTED_TOTAL || offset > total {
                     return None;
                 }
-                frag = Some((count as u16, index as u16));
+                frag = Some((total, offset));
             }
         }
         let len = len.unwrap_or(self.r.remaining());
         let data = self.r.bytes(len)?;
+        if let Some((total, offset)) = frag {
+            if offset as usize + data.len() > total as usize {
+                return None;
+            }
+        }
         Some(Msg {
             channel: b.header.channel,
             seq,
@@ -479,6 +500,8 @@ pub struct Manager {
     tx: TxQueue,
     scratch: Vec<(u32, Option<ReasonRec>)>,
     stats: ManagerStats,
+    /// Latest time passed to any call; used as the enqueue time of `send`.
+    now_hint: Time,
 }
 
 fn cookie_mac(key: [u64; 2], addr: &SocketAddr, nonce: u64, timestamp: u32, protocol_id: u32) -> u64 {
@@ -520,6 +543,7 @@ impl Manager {
             tx: TxQueue::default(),
             scratch: Vec::new(),
             stats: ManagerStats::default(),
+            now_hint: now,
         })
     }
 
@@ -693,35 +717,63 @@ impl Manager {
         Ok(())
     }
 
-    /// Queues a message. It is put on the wire by the next [`flush`](Self::flush).
+    /// Queues a message with the channel defaults. It is put on the wire by a later
+    /// [`flush`](Self::flush): the next one unless the bandwidth budget holds it back.
     pub fn send(&mut self, id: PeerId, channel: u8, data: &[u8]) -> Result<(), SendError> {
+        self.send_with(id, channel, data, SendOptions::default())
+    }
+
+    /// Queues a message with per-message priority, TTL or replace key.
+    pub fn send_with(&mut self, id: PeerId, channel: u8, data: &[u8], options: SendOptions) -> Result<(), SendError> {
         let index = self.index_of(id).ok_or(SendError::NotConnected)?;
         let config = &self.config;
+        let now = self.now_hint;
         let peer = self.slots[index].peer.as_mut().ok_or(SendError::NotConnected)?;
         if !matches!(peer.state, State::Connected) {
             return Err(SendError::NotConnected);
         }
-        let ch = peer
-            .channels
-            .get_mut(usize::from(channel))
-            .ok_or(SendError::InvalidChannel)?;
+        let c = usize::from(channel);
+        let ch = peer.channels.get_mut(c).ok_or(SendError::InvalidChannel)?;
+        let defaults = &config.channels[c];
         if data.len() > config.max_message_size(ch.mode) {
             return Err(SendError::TooLarge);
         }
+        let priority = options.priority.unwrap_or(defaults.priority);
         if ch.mode.is_reliable() {
+            if options.ttl.is_some() || options.replace_key.is_some() {
+                return Err(SendError::InvalidOptions);
+            }
             // A sequenced channel replaces its queue, so it never fills up.
             if ch.mode != DeliveryMode::ReliableSequenced && ch.reliable_queue_len() >= config.max_reliable_queue {
                 return Err(SendError::QueueFull);
             }
-            ch.queue_reliable(data, config.single_reliable_limit(), config.fragment_size());
+            ch.queue_reliable(data, config.single_reliable_limit(), now, priority);
         } else {
-            ch.queue_unreliable(data);
+            let opts = SendOpts {
+                priority,
+                ttl: options.ttl.or(defaults.ttl),
+                replace_key: options.replace_key,
+            };
+            if ch.queue_unreliable(data, now, opts) {
+                peer.stats.messages_replaced += 1;
+            }
         }
         Ok(())
     }
 
+    /// Messages of a channel still waiting to be sent (unreliable) or acknowledged (reliable).
+    pub fn queued_messages(&self, id: PeerId, channel: u8) -> Option<usize> {
+        let ch = self.peer(id)?.channels.get(usize::from(channel))?;
+        Some(if ch.mode.is_reliable() {
+            ch.reliable_queue_len()
+        } else {
+            ch.unreliable_queue_len()
+        })
+    }
+
     /// Processes one received datagram.
     pub fn handle_datagram(&mut self, now: Time, from: SocketAddr, data: &[u8]) {
+        self.now_hint = self.now_hint.max(now);
         self.stats.datagrams_received += 1;
         if data.is_empty() || data.len() > self.config.mtu {
             self.stats.datagrams_dropped += 1;
@@ -1064,6 +1116,7 @@ impl Manager {
 
     /// Runs timers: handshake retransmissions, connection and handshake timeouts.
     pub fn update(&mut self, now: Time) {
+        self.now_hint = self.now_hint.max(now);
         let Manager {
             config,
             slots,
@@ -1131,6 +1184,7 @@ impl Manager {
     /// Packs queued messages into DATA packets for every connected peer; also sends
     /// pending acks, pings and keepalives.
     pub fn flush(&mut self, now: Time) {
+        self.now_hint = self.now_hint.max(now);
         let Manager { config, slots, tx, .. } = self;
         for slot in slots.iter_mut() {
             if let Some(peer) = slot.peer.as_mut() {
@@ -1373,168 +1427,371 @@ fn send_ping_ack(peer: &mut Peer, now: Time, mtu: usize, tx: &mut TxQueue) {
     peer.stats.ping_acks_sent += 1;
 }
 
-/// Wire size of an item inside a block: `(bytes before the payload without the length
-/// prefix, payload length)`.
-fn item_wire(info: &ItemInfo<'_>, reliable: bool, prev_seq: u16) -> (usize, usize) {
-    let mut meta = 0;
+/// A piece selected for this flush and the packet it was placed in.
+#[derive(Debug, Clone, Copy)]
+struct Sel {
+    cand: u32,
+    start: u32,
+    end: u32,
+    packet: u32,
+    /// Write order inside a packet: block rank, seq offset, start, selection index.
+    key: (u8, u16, u32, u32),
+}
+
+/// A packet being planned.
+#[derive(Debug, Clone, Copy)]
+struct Plan {
+    remaining: usize,
+    counts: [u16; MAX_CHANNELS],
+    /// Channel of an item that fits only without its length prefix and must come last.
+    tail_channel: Option<u8>,
+}
+
+/// Scratch space of the scheduler, kept per peer so that flushing does not allocate.
+#[derive(Debug, Default)]
+struct Scheduler {
+    sel: Vec<Sel>,
+    placed: Vec<Sel>,
+    plans: Vec<Plan>,
+    /// `(remaining, plan index)` of plans with free space, sorted ascending.
+    free: Vec<(usize, u32)>,
+    /// Packet seq of each planned packet.
+    seqs: Vec<u16>,
+}
+
+/// Pieces smaller than this are not cut from a fragmented message unless they finish it.
+const MIN_PIECE: usize = 64;
+/// Upper bound of a reliable tag varint: deltas within the window need at most 2 bytes.
+const TAG_MAX: usize = varint_len(((crate::channel::RELIABLE_WINDOW as u64) << 1) | 1);
+
+/// Extra bytes a block needs when it grows from `count` to `count + 1` items.
+fn block_delta(count: usize, reliable: bool) -> usize {
+    if count == 0 {
+        1 + if reliable { 2 } else { 0 }
+    } else {
+        BlockHeader::encoded_len(count + 1) - BlockHeader::encoded_len(count)
+    }
+}
+
+/// Upper bound of `block_delta` for any count.
+fn block_delta_max(reliable: bool) -> usize {
+    if reliable { 3 } else { 1 }
+}
+
+/// Bytes of an item without its block overhead: length prefix, reliable tag, fragment fields
+/// and payload.
+fn item_cost(piece: &Piece<'_>, reliable: bool, len: usize) -> usize {
+    let mut cost = varint_len(len as u64) + len;
     if reliable {
-        let delta = u64::from(info.seq.wrapping_sub(prev_seq));
-        meta += varint_len((delta << 1) | u64::from(info.frag.is_some()));
-        if let Some((count, index)) = info.frag {
-            meta += varint_len(u64::from(count)) + varint_len(u64::from(index));
+        cost += TAG_MAX;
+    }
+    if let Some((total, offset)) = piece.frag {
+        cost += varint_len(u64::from(total)) + varint_len(u64::from(offset));
+    }
+    cost
+}
+
+/// Largest piece of a fragment that fits into `space` bytes of item cost, or `None`.
+fn piece_len(piece: &Piece<'_>, reliable: bool, want: usize, space: usize) -> Option<usize> {
+    let fixed = item_cost(piece, reliable, 0) - 1; // without the 1-byte length of 0
+    let mut p = want.min(space.checked_sub(fixed)?);
+    while p > 0 && fixed + varint_len(p as u64) + p > space {
+        p -= 1;
+    }
+    (p == want || p >= MIN_PIECE).then_some(p)
+}
+
+impl Scheduler {
+    fn clear(&mut self) {
+        self.sel.clear();
+        self.placed.clear();
+        self.plans.clear();
+        self.free.clear();
+        self.seqs.clear();
+    }
+
+    fn new_plan(&mut self, capacity: usize) -> u32 {
+        self.plans.push(Plan {
+            remaining: capacity,
+            counts: [0; MAX_CHANNELS],
+            tail_channel: None,
+        });
+        (self.plans.len() - 1) as u32
+    }
+
+    fn set_free(&mut self, plan: u32, old: Option<usize>) {
+        if let Some(r) = old {
+            if let Ok(i) = self.free.binary_search(&(r, plan)) {
+                self.free.remove(i);
+            }
+        }
+        let r = self.plans[plan as usize].remaining;
+        if r > 0 {
+            let i = self.free.partition_point(|&e| e < (r, plan));
+            self.free.insert(i, (r, plan));
         }
     }
-    (meta, info.data.len())
+
+    /// Accounts `cost` plus the block overhead of `channel` in `plan`.
+    fn place(&mut self, plan: u32, channel: u8, reliable: bool, cost: usize, sel: Sel) {
+        let p = &mut self.plans[plan as usize];
+        let old = p.remaining;
+        let c = &mut p.counts[usize::from(channel)];
+        p.remaining -= block_delta(usize::from(*c), reliable) + cost;
+        *c += 1;
+        self.placed.push(Sel { packet: plan, ..sel });
+        self.set_free(plan, Some(old));
+    }
 }
 
 fn flush_peer(peer: &mut Peer, now: Time, config: &Config, tx: &mut TxQueue) {
     let ping_due = now - peer.last_ping >= config.ping_interval;
     let rto = peer.rtt.rto();
+    if let Some(rate) = config.bandwidth {
+        let burst = i64::from(rate / 10).max(2 * config.mtu as i64);
+        let gained = (now - peer.last_refill).as_micros() * u128::from(rate) / 1_000_000;
+        peer.tokens = (peer.tokens + i64::try_from(gained).unwrap_or(i64::MAX)).min(burst);
+        peer.last_refill = now;
+    }
     let Peer {
         channels,
-        items,
+        cands,
+        sched,
         sent,
         stats,
         recv,
         addr,
         ..
     } = peer;
-    items.clear();
+    cands.clear();
+    sched.clear();
+    let mut cstats = CollectStats::default();
     for (i, ch) in channels.iter_mut().enumerate() {
-        ch.collect(i as u8, now, rto, config.max_rto, items);
+        ch.collect(
+            i as u8,
+            now,
+            rto,
+            config.max_rto,
+            config.starvation_time,
+            cands,
+            &mut cstats,
+        );
     }
-    if items.is_empty() && !ping_due && !peer.ack_pending {
-        return;
-    }
+    stats.messages_expired += cstats.expired;
     let ack = if peer.received_any && (peer.ack_pending || peer.ack_repeat > 0) {
         recv.ack()
             .map(|(ack, bits)| (ack, bits, encode_ack_delay(now - peer.largest_recv_time)))
     } else {
         None
     };
+    let header_len = if ack.is_some() { DATA_HEADER_MAX } else { 3 };
     let mtu = config.mtu;
-    let mut pos = 0usize;
-    let mut first = true;
-    loop {
-        let seq = peer.next_seq;
-        let start = tx.reserve(mtu);
-        let mut w = Writer::new(&mut tx.bytes[start..start + mtu]);
-        let flags = if first && ping_due { FLAG_PING } else { 0 };
-        if (DataHeader { flags, seq, ack }).encode(&mut w).is_err() {
-            tx.bytes.truncate(start);
-            return;
-        }
-        let record = record_packet(sent, channels, stats, seq, now);
-        let mut messages = 0u64;
-        while pos < items.len() {
-            let c = items[pos].0;
-            let ch = &channels[usize::from(c)];
-            let reliable = ch.mode.is_reliable();
-            let fixed = if reliable { 2 } else { 0 };
-            let remaining = w.remaining();
-            let base = ch.info(items[pos].1).seq;
-            // Plan the block: as many items of this channel as fit.
-            let (mut k, mut size, mut prev) = (0usize, 0usize, base);
-            let mut tail = false;
-            while pos + k < items.len() && items[pos + k].0 == c {
-                let info = ch.info(items[pos + k].1);
-                let (meta, len) = item_wire(&info, reliable, prev);
-                let with_len = varint_len(len as u64) + meta + len;
-                if BlockHeader::encoded_len(k + 1) + fixed + size + with_len <= remaining {
-                    size += with_len;
-                    k += 1;
-                    prev = info.seq;
+    let capacity = mtu - header_len;
+
+    // ---- phase 1: what goes out now, by effective priority, within the budget ----
+    // Highest effective priority first; among equals, the oldest message first.
+    cands.sort_unstable_by_key(|c| (core::cmp::Reverse(c.priority), c.enqueued, c.channel, c.order, c.start));
+    let budget = config
+        .bandwidth
+        .map(|_| usize::try_from(peer.tokens.max(0)).unwrap_or(0));
+    let mut used = 0usize;
+    for (i, c) in cands.iter().enumerate() {
+        let ch = &channels[usize::from(c.channel)];
+        let reliable = ch.mode.is_reliable();
+        let piece = ch.piece(c.kind, c.start, c.end);
+        let len = (c.end - c.start) as usize;
+        let mut end = c.end;
+        let mut cost = item_cost(&piece, reliable, len) + block_delta_max(reliable);
+        if let Some(b) = budget {
+            if used >= b {
+                break;
+            }
+            if used + cost > b && c.splittable {
+                let space = b - used - block_delta_max(reliable);
+                let Some(p) = piece_len(&piece, reliable, len, space) else {
                     continue;
-                }
-                // The item may still fit as the last one, without its length prefix.
-                if BlockHeader::encoded_len(k + 1) + fixed + size + meta + len <= remaining {
-                    size += meta + len;
-                    k += 1;
-                }
-                tail = true;
-                break;
+                };
+                end = c.start + p as u32;
+                cost = item_cost(&piece, reliable, p) + block_delta_max(reliable);
             }
-            if k == 0 {
-                break;
+        }
+        // Each full packet also costs a header.
+        used += cost + cost * header_len / capacity;
+        let seq_offset = if reliable { ch.seq_offset(piece.seq) } else { 0 };
+        let idx = sched.sel.len() as u32;
+        sched.sel.push(Sel {
+            cand: i as u32,
+            start: c.start,
+            end,
+            packet: 0,
+            key: (c.channel, seq_offset, c.start, idx),
+        });
+    }
+
+    // ---- phase 2: best fit decreasing into packets; fragments fill the gaps ----
+    let sel_len = sched.sel.len();
+    {
+        let cands = &*cands;
+        let channels = &*channels;
+        let cost_of = |s: &Sel| {
+            let c = &cands[s.cand as usize];
+            let ch = &channels[usize::from(c.channel)];
+            item_cost(
+                &ch.piece(c.kind, s.start, s.end),
+                ch.mode.is_reliable(),
+                (s.end - s.start) as usize,
+            )
+        };
+        sched.sel.sort_unstable_by_key(|s| {
+            let splittable = cands[s.cand as usize].splittable;
+            (splittable, core::cmp::Reverse(cost_of(s)), s.key.3)
+        });
+        for i in 0..sel_len {
+            let s = sched.sel[i];
+            let c = cands[s.cand as usize];
+            let ch = &channels[usize::from(c.channel)];
+            let reliable = ch.mode.is_reliable();
+            if !c.splittable {
+                let cost = cost_of(&s);
+                let need = cost + block_delta_max(reliable);
+                let fi = sched.free.partition_point(|&(r, _)| r < need);
+                if let Some(&(_, plan)) = sched.free.get(fi) {
+                    sched.place(plan, c.channel, reliable, cost, s);
+                } else if need <= capacity {
+                    let plan = sched.new_plan(capacity);
+                    sched.place(plan, c.channel, reliable, cost, s);
+                } else {
+                    // Fits only as the last item of an empty packet, without its length.
+                    let plan = sched.new_plan(capacity);
+                    sched.plans[plan as usize].remaining = 0;
+                    sched.plans[plan as usize].tail_channel = Some(c.channel);
+                    sched.placed.push(Sel { packet: plan, ..s });
+                }
+                continue;
             }
-            if !tail {
-                let after = remaining - BlockHeader::encoded_len(k) - fixed - size;
-                tail = match items.get(pos + k) {
-                    None => true,
-                    Some(&(nc, nitem)) => {
-                        let nch = &channels[usize::from(nc)];
-                        let ninfo = nch.info(nitem);
-                        let nrel = nch.mode.is_reliable();
-                        let (meta, len) = item_wire(&ninfo, nrel, ninfo.seq);
-                        1 + if nrel { 2 } else { 0 } + meta + len > after
+            // A fragment range: cut pieces into the largest gaps, then into new packets.
+            let mut start = s.start;
+            while start < s.end {
+                let want = (s.end - start) as usize;
+                let piece = ch.piece(c.kind, start, s.end);
+                let (plan, space) = match sched.free.last() {
+                    Some(&(r, plan)) if r > block_delta_max(reliable) => (plan, r - block_delta_max(reliable)),
+                    _ => (u32::MAX, 0),
+                };
+                let p = (plan != u32::MAX)
+                    .then(|| piece_len(&piece, reliable, want, space))
+                    .flatten();
+                let (plan, p) = match p {
+                    Some(p) => (plan, p),
+                    None => {
+                        let plan = sched.new_plan(capacity);
+                        let space = capacity - block_delta_max(reliable);
+                        let p = piece_len(&piece, reliable, want, space).expect("a piece fits an empty packet");
+                        (plan, p)
                     }
                 };
+                let end = start + p as u32;
+                let sub = ch.piece(c.kind, start, end);
+                let cost = item_cost(&sub, reliable, p);
+                let key = (s.key.0, s.key.1, start, s.key.3);
+                sched.place(plan, c.channel, reliable, cost, Sel { start, end, key, ..s });
+                start = end;
             }
-            let ok = (|| {
+        }
+    }
+    let packets = sched.plans.len();
+    if packets == 0 && !ping_due && !peer.ack_pending {
+        for c in channels.iter_mut() {
+            stats.messages_stale += c.after_flush();
+        }
+        return;
+    }
+
+    // ---- write packets ----
+    for (pi, p) in sched.plans.iter().enumerate() {
+        if let Some(tc) = p.tail_channel {
+            for s in sched.placed.iter_mut() {
+                if s.packet as usize == pi && cands[s.cand as usize].channel == tc {
+                    s.key.0 = u8::MAX;
+                }
+            }
+        }
+    }
+    sched.placed.sort_unstable_by_key(|s| (s.packet, s.key));
+    let mut i = 0;
+    for packet in 0..packets.max(1) {
+        let seq = peer.next_seq;
+        sched.seqs.push(seq);
+        let flags = if packet == 0 && ping_due { FLAG_PING } else { 0 };
+        let start = tx.reserve(mtu);
+        let mut w = Writer::new(&mut tx.bytes[start..start + mtu]);
+        let record = record_packet(sent, channels, stats, seq, now);
+        let first_item = i;
+        let ok = (|| {
+            DataHeader { flags, seq, ack }.encode(&mut w)?;
+            while i < sched.placed.len() && sched.placed[i].packet as usize == packet {
+                let c = cands[sched.placed[i].cand as usize].channel;
+                let ch = &channels[usize::from(c)];
+                let reliable = ch.mode.is_reliable();
+                let count = sched.placed[i..]
+                    .iter()
+                    .take_while(|s| s.packet as usize == packet && cands[s.cand as usize].channel == c)
+                    .count();
+                let last_block = sched.placed.get(i + count).is_none_or(|s| s.packet as usize != packet);
                 BlockHeader {
                     channel: c,
-                    tail,
-                    count: k,
+                    tail: last_block,
+                    count,
                 }
                 .encode(&mut w)?;
+                let first = sched.placed[i];
+                let base = ch.piece(cands[first.cand as usize].kind, first.start, first.end).seq;
                 if reliable {
                     w.u16(base)?;
                 }
                 let mut prev = base;
-                for j in 0..k {
-                    let info = ch.info(items[pos + j].1);
-                    if !(tail && j == k - 1) {
-                        w.varint(info.data.len() as u64)?;
+                for (j, s) in sched.placed[i..i + count].iter().enumerate() {
+                    let p = ch.piece(cands[s.cand as usize].kind, s.start, s.end);
+                    if !(last_block && j == count - 1) {
+                        w.varint(p.data.len() as u64)?;
                     }
                     if reliable {
-                        let delta = u64::from(info.seq.wrapping_sub(prev));
-                        w.varint((delta << 1) | u64::from(info.frag.is_some()))?;
-                        if let Some((count, index)) = info.frag {
-                            w.varint(u64::from(count))?;
-                            w.varint(u64::from(index))?;
+                        let delta = u64::from(p.seq.wrapping_sub(prev));
+                        w.varint((delta << 1) | u64::from(p.frag.is_some()))?;
+                        if let Some((total, offset)) = p.frag {
+                            w.varint(u64::from(total))?;
+                            w.varint(u64::from(offset))?;
                         }
-                        prev = info.seq;
+                        prev = p.seq;
+                        record.units.push((c, p.seq, s.start));
                     }
-                    w.bytes(info.data)?;
+                    w.bytes(p.data)?;
                 }
-                Ok::<(), crate::wire::Full>(())
-            })();
-            debug_assert!(ok.is_ok(), "packet planner overflowed the buffer");
-            if ok.is_err() {
-                break;
+                i += count;
             }
-            let ch = &mut channels[usize::from(c)];
-            for &(_, item) in &items[pos..pos + k] {
-                if let Item::Reliable(..) = item {
-                    let info = ch.info(item);
-                    record.units.push((c, info.seq, info.frag.map_or(0, |f| f.1)));
-                    if ch.mark_sent(item, now, seq) {
-                        stats.messages_retransmitted += 1;
-                    }
-                }
-            }
-            messages += k as u64;
-            pos += k;
-            if tail {
-                break;
-            }
-        }
+            Ok::<(), crate::wire::Full>(())
+        })();
+        debug_assert!(ok.is_ok(), "packet planner overflowed the buffer");
         let len = w.pos();
         tx.commit(*addr, start, len);
         peer.next_seq = seq.wrapping_add(1);
+        peer.tokens -= len as i64;
+        let items = (i - first_item) as u64;
         stats.packets_sent += 1;
         stats.bytes_sent += len as u64;
-        stats.messages_sent += messages;
-        if messages == 0 && flags & FLAG_PING == 0 {
+        stats.messages_sent += items;
+        if items == 0 && flags & FLAG_PING == 0 {
             stats.standalone_acks_sent += 1;
         }
-        first = false;
-        if pos >= items.len() {
-            break;
-        }
-        if messages == 0 {
-            debug_assert!(false, "an item does not fit into an empty packet");
-            break;
+    }
+
+    // ---- record transmissions, per message in offset order ----
+    sched.placed.sort_unstable_by_key(|s| (s.cand, s.start));
+    for s in &sched.placed {
+        let c = cands[s.cand as usize];
+        let seq = sched.seqs[s.packet as usize];
+        if channels[usize::from(c.channel)].mark_sent(c.kind, s.start, s.end, now, seq) {
+            stats.messages_retransmitted += 1;
         }
     }
     if ping_due {
@@ -1546,6 +1803,6 @@ fn flush_peer(peer: &mut Peer, now: Time, config: &Config, tx: &mut TxQueue) {
         peer.ack_repeat = peer.ack_repeat.saturating_sub(1);
     }
     for c in channels.iter_mut() {
-        c.clear_unreliable();
+        stats.messages_stale += c.after_flush();
     }
 }

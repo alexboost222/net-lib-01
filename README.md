@@ -15,7 +15,7 @@ UDP-транспорт на Rust для fast-paced мультиплеера (FPS
 
 **M2**: все пять режимов доставки (`Unreliable`, `UnreliableSequenced`, `ReliableUnordered`, `ReliableOrdered`, `ReliableSequenced`).
 Повторная отправка по порогу пакетов и по RTO с backoff, фрагментация до 64 КиБ, сетевой RTT без задержки подтверждения (`ack_delay`, защита как в QUIC).
-Упаковка с приоритетами появится в M3.
+**M3**: планировщик — упаковка best-fit decreasing, приоритеты с защитой от голодания, бюджет полосы, TTL, `replace_key`, ноль аллокаций в рабочем цикле.
 
 ## Структура
 

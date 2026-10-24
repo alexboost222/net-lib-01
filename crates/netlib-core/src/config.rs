@@ -32,15 +32,47 @@ impl DeliveryMode {
 pub struct ChannelConfig {
     /// Delivery guarantees.
     pub mode: DeliveryMode,
-    /// Base send priority; higher is sent first when bandwidth is short.
+    /// Base send priority; higher is sent first when a packet or the bandwidth budget
+    /// is short. Waiting messages gain priority over time (`Config::starvation_time`).
     pub priority: u8,
+    /// Unreliable channels only: a message not sent within this time is dropped.
+    /// Matters only when the bandwidth budget holds messages back.
+    pub ttl: Option<Duration>,
 }
 
 impl ChannelConfig {
-    /// A channel with the given mode and default priority (128).
+    /// A channel with the given mode, priority 128 and, for unreliable modes, a TTL of 1 s.
     pub fn new(mode: DeliveryMode) -> Self {
-        ChannelConfig { mode, priority: 128 }
+        ChannelConfig {
+            mode,
+            priority: 128,
+            ttl: (!mode.is_reliable()).then_some(Duration::from_secs(1)),
+        }
     }
+
+    /// Sets the priority.
+    pub fn with_priority(mut self, priority: u8) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    /// Sets the TTL of unreliable messages.
+    pub fn with_ttl(mut self, ttl: Option<Duration>) -> Self {
+        self.ttl = ttl;
+        self
+    }
+}
+
+/// Per-message overrides for [`Manager::send_with`](crate::Manager::send_with).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SendOptions {
+    /// Overrides the channel priority.
+    pub priority: Option<u8>,
+    /// Unreliable only: overrides the channel TTL.
+    pub ttl: Option<Duration>,
+    /// Unreliable only: a queued, not yet sent message of the channel with the same key is
+    /// replaced (e.g. the key is an entity id and the message its latest state).
+    pub replace_key: Option<u32>,
 }
 
 /// Configuration of a [`Manager`](crate::Manager).
@@ -79,6 +111,12 @@ pub struct Config {
     pub max_reliable_message: usize,
     /// Reliable messages per channel waiting for an ack before `send` fails with `QueueFull`.
     pub max_reliable_queue: usize,
+    /// Bandwidth budget per peer in bytes per second (UDP payload); `None` is unlimited.
+    /// Acks and pings are always sent.
+    pub bandwidth: Option<u32>,
+    /// Waiting time after which any queued message reaches the top priority (255), so low
+    /// priority traffic cannot starve.
+    pub starvation_time: Duration,
 }
 
 impl Default for Config {
@@ -100,6 +138,8 @@ impl Default for Config {
             max_connect_data: 256,
             max_reliable_message: 64 * 1024,
             max_reliable_queue: 4096,
+            bandwidth: None,
+            starvation_time: Duration::from_millis(500),
         }
     }
 }
@@ -122,7 +162,7 @@ pub enum ConfigError {
     Timing,
     /// `max_connect_data` does not fit into a minimal-MTU packet.
     ConnectData,
-    /// `max_reliable_message` needs too many fragments or `max_reliable_queue` is zero.
+    /// Reliable limits, starvation time or bandwidth are out of range.
     ReliableLimits,
 }
 
@@ -163,8 +203,10 @@ impl Config {
         if 1 + 8 + 4 + 8 + 3 + self.max_connect_data > MIN_MTU {
             return Err(ConfigError::ConnectData);
         }
-        if self.max_reliable_message.div_ceil(self.fragment_size()) > crate::channel::MAX_FRAGMENTS
+        if self.max_reliable_message > crate::channel::MAX_FRAGMENTED_TOTAL
             || self.max_reliable_queue == 0
+            || self.starvation_time == Duration::ZERO
+            || self.bandwidth == Some(0)
         {
             return Err(ConfigError::ReliableLimits);
         }
@@ -185,10 +227,5 @@ impl Config {
     /// header, block header, base seq, a 3-byte length and a 1-byte tag.
     pub(crate) fn single_reliable_limit(&self) -> usize {
         self.mtu - crate::wire::DATA_HEADER_MAX - 1 - 2 - 3 - 1
-    }
-
-    /// Payload of one fragment: as above plus 2-byte fragment count and index.
-    pub(crate) fn fragment_size(&self) -> usize {
-        self.single_reliable_limit() - 4
     }
 }

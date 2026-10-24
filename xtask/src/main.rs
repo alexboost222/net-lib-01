@@ -66,13 +66,17 @@ fn run(cmd: &str, args: &[&str]) -> (bool, String) {
     }
 }
 
-/// Criterion id encoded in a test name: `pk1_foo` -> `PK1`.
-fn criterion_of(test: &str) -> Option<String> {
-    let name = test.rsplit("::").next()?;
-    let prefix = name.split('_').next()?;
-    let letters = prefix.trim_end_matches(|c: char| c.is_ascii_digit());
-    let valid = !letters.is_empty() && letters.len() < prefix.len() && letters.chars().all(|c| c.is_ascii_lowercase());
-    valid.then(|| prefix.to_ascii_uppercase())
+/// Criterion ids encoded in a test name: `pk1_pk2_foo` -> `["PK1", "PK2"]`.
+fn criteria_of(test: &str) -> Vec<String> {
+    let name = test.rsplit("::").next().unwrap_or(test);
+    name.split('_')
+        .map_while(|part| {
+            let letters = part.trim_end_matches(|c: char| c.is_ascii_digit());
+            let valid =
+                !letters.is_empty() && letters.len() < part.len() && letters.chars().all(|c| c.is_ascii_lowercase());
+            valid.then(|| part.to_ascii_uppercase())
+        })
+        .collect()
 }
 
 #[derive(Default)]
@@ -132,7 +136,7 @@ fn report(args: &[String]) -> ExitCode {
         };
         total.0 += usize::from(ok);
         total.1 += 1;
-        if let Some(id) = criterion_of(name) {
+        for id in criteria_of(name) {
             let r = results.entry(id).or_default();
             if ok { &mut r.passed } else { &mut r.failed }.push(name.to_string());
         }
@@ -215,14 +219,15 @@ fn report(args: &[String]) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::criterion_of;
+    use super::criteria_of;
 
     #[test]
     fn criterion_ids_from_test_names() {
-        assert_eq!(criterion_of("r5_timeout").as_deref(), Some("R5"));
-        assert_eq!(criterion_of("wire::tests::b1_b2_header").as_deref(), Some("B1"));
-        assert_eq!(criterion_of("pk1_count").as_deref(), Some("PK1"));
-        assert_eq!(criterion_of("unreliable_roundtrip"), None);
-        assert_eq!(criterion_of("rtt_is_measured"), None);
+        assert_eq!(criteria_of("r5_timeout"), ["R5"]);
+        assert_eq!(criteria_of("wire::tests::b1_data_header"), ["B1"]);
+        assert_eq!(criteria_of("pk1_pk2_random"), ["PK1", "PK2"]);
+        assert_eq!(criteria_of("p1_pk5_steady"), ["P1", "PK5"]);
+        assert!(criteria_of("unreliable_roundtrip").is_empty());
+        assert!(criteria_of("rtt_is_measured").is_empty());
     }
 }
